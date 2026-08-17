@@ -17,10 +17,12 @@ The schema must be small, yet stable enough that local/remote/sandboxed filesyst
 | Tool | Our schema | Claude Code | OpenCode | Notes |
 |---|---|---|---|---|
 | `read` | `read(file_path, offset?, limit?)` | `Read(file_path, offset?, limit?, pages?)` | `read(filePath, offset?, limit?)` | Files only; 1-indexed `offset`; no image/PDF/multimodal support in the first pass. |
-| `write` | `write(file_path, content)` | `Write(file_path, content)` | `write(content, filePath)` | Creates or overwrites UTF-8 text. Under the default fs-observation-policy, updates to existing files require a prior observation; new-file creates do not. |
-| `edit` | `edit(file_path, old_string, new_string, replace_all?)` | `Edit(file_path, old_string, new_string, replace_all?)` | `edit(filePath, oldString, newString, replaceAll?)` | Literal string replacement; unique match required by default; under the default fs-observation-policy requires a prior observation (any windowed read counts). |
+| `write` | `write(file_path, content, content_format?)` | `Write(file_path, content)` | `write(content, filePath)` | Creates or overwrites UTF-8 text. Format defaults to lossless `text`; `escaped` explicitly decodes one strict layer. Existing targets are backed up by default. |
+| `edit` | `edit(file_path, old_string, new_string, old_string_format?, new_string_format?, replace_all?)` | `Edit(file_path, old_string, new_string, replace_all?)` | `edit(filePath, oldString, newString, replaceAll?)` | Safe progressive string replacement; unique match required by default. Formats default to lossless `text`, and existing targets are backed up. |
 
 The schema uses snake_case field names (`file_path`, `old_string`, `new_string`, `replace_all`) to align with Claude Code and with existing DeepSeek Harness tool-schema examples. The Consumer package translates these model-facing names into `ctx.fs` calls and `fs/*` event dispatches.
+
+[Filesystem mutation safety](2026-08-17-filesystem-mutation-safety.md) owns the later matching, provider-backup, and explicit-format decisions.
 
 ## Tool schemas
 
@@ -48,6 +50,7 @@ Arguments:
 
 - `file_path: string` — required. Path to write, resolved by `ctx.fs`.
 - `content: string` — required. Full UTF-8 text content to write.
+- `content_format?: 'text' | 'escaped'` — optional. Defaults to lossless JSON-decoded text; `escaped` decodes one strict additional layer.
 
 Under the default fs-observation-policy, updating an existing file with `write` requires a prior observation (a read/write/edit) of that file by the same execution context; the `dsh-fs-observation-policy` plugin supplies the observed version as the stale guard on `fs/write-intent`. Creating a new file does not require a prior observation. With the policy plugin absent, `write` is an unconditional bare-provider create-or-overwrite.
 
@@ -62,11 +65,13 @@ Arguments:
 - `file_path: string` — required. Path to edit, resolved by `ctx.fs`.
 - `old_string: string` — required. Literal text to replace. Empty strings are invalid in the first pass.
 - `new_string: string` — required. Literal replacement text; an empty string deletes the match.
+- `old_string_format?: 'text' | 'escaped'` — optional transport for `old_string`; defaults to `text`.
+- `new_string_format?: 'text' | 'escaped'` — optional transport for `new_string`; defaults to `text`.
 - `replace_all?: boolean` — optional. Defaults to false. When false, `old_string` must identify exactly one match.
 
 `edit` requires a prior observation of the file in the same execution context (any windowed read counts — authorization is version freshness, not a full-view requirement), or a prior write/edit by that context. The `dsh-fs-observation-policy` policy plugin derives the owner and supplies the recorded version as the stale guard; the provider's mutation lock enforces it.
 
-The first pass rejects Codex-style patch grammars and multi-mode edit APIs. It uses one strict literal replacement mode so the model-facing contract stays simple and the backend can own exact-match, duplicate-match, line-ending, and stale-version semantics.
+The tool rejects Codex-style patch grammars and multi-mode edit APIs. The backend owns safe progressive matching, ambiguity, line endings, backup, and stale-version semantics; format fields affect only explicit string decoding.
 
 ## Result shape
 
@@ -77,8 +82,8 @@ Default native projections:
 | Tool | Structured `ctx.fs` outcome consumed by `tool-fs` | Default model projection |
 |---|---|---|
 | `read` | returned lines, returned line count, total line count, target display path, file version, partial-view flag | line-numbered text plus pagination footer |
-| `write` | create/update operation, target display path, new file version | concise create/update success text |
-| `edit` | replacement count, replace-all flag, target display path, new file version | concise edit success text |
+| `write` | create/update operation, target display path, before/after text, backup path/bytes | concise create/update text plus recovery path when backed up |
+| `edit` | before/after text, match strategy, target display path, backup path/bytes | concise edit text plus recovery path and fallback warning when applicable |
 
 The structured outcome does not restate model arguments such as `file_path`, `old_string`, or `content` unless the backend has resolved them into new information such as `displayPath`, `targetKey`, or a new version. Token-conscious truncation is part of the model projection, not the backend's canonical result.
 
@@ -99,7 +104,7 @@ Schema tests pin the required/optional argument set per tool, empty-`old_string`
 
 ## Alternatives considered
 
-- **A Codex-style patch grammar or multi-mode edit API** — rejected: one strict literal replacement mode keeps the model-facing contract simple and lets the backend own exact-match, duplicate-match, line-ending, and stale-version semantics.
+- **A Codex-style patch grammar or multi-mode edit API** — rejected: one replacement operation keeps the model-facing contract small while the backend owns matching, ambiguity, line endings, backup, and stale-version semantics.
 - **camelCase argument names (OpenCode's style)** — snake_case aligns with Claude Code and the existing harness tool-schema examples, and naming is public API once shipped.
 - **Model-facing `expected_hash` / `expected_version` / `create_only` parameters** — rejected: stale checks are driven by backend-minted versions and the policy plugin's observed state, never by fragile model-copied tokens.
 

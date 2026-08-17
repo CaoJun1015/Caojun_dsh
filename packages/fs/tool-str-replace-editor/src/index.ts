@@ -6,8 +6,8 @@
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditMatchOptions, FsInfo, FsTarget, FsWriteIntent } from '@deepseek-ai/dsh-fs'
+import { FsError, resolveFsText } from '@deepseek-ai/dsh-fs'
+import type { FsEditMatchOptions, FsInfo, FsTarget, FsTextFormat, FsWriteIntent } from '@deepseek-ai/dsh-fs'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
@@ -22,6 +22,7 @@ Custom editing tool for viewing, creating and editing files
 * If \`path\` is a file, \`view\` displays the result of applying \`cat -n\`. If \`path\` is a directory, \`view\` lists non-hidden files and directories up to 2 levels deep
 * The \`create\` command cannot be used if the specified \`path\` already exists as a file
 * If a \`command\` generates a long output, it will be truncated and marked with \`<response clipped>\`
+* Text format parameters default to \`text\`: use the JSON-decoded string unchanged. JSON \`"\\n"\` is a newline, while \`"\\\\n"\` is a literal backslash plus n. Choose \`escaped\` only to decode one additional strict layer
 
 Notes for using the \`str_replace\` command:
 * The \`old_str\` parameter must identify one unique region. Progressive matching can ignore outer search whitespace, per-line trailing whitespace, and full-width ASCII differences; approximate candidates are suggestions only
@@ -234,10 +235,15 @@ async function createFile(
   policy: MutationPolicy,
   path: string,
   fileText: string | undefined,
+  fileTextFormat: FsTextFormat | undefined,
   backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
-  const content = requiredForCommand(fileText, 'file_text', 'create')
+  const content = resolveFsText(
+    requiredForCommand(fileText, 'file_text', 'create'),
+    fileTextFormat ?? 'text',
+    'file_text',
+  )
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   if (await ctx.fs.stat(target, exec.signal) !== undefined) {
@@ -274,6 +280,8 @@ async function replaceInFile(
   path: string,
   oldStr: string | undefined,
   newStr: string | undefined,
+  oldStrFormat: FsTextFormat | undefined,
+  newStrFormat: FsTextFormat | undefined,
   matchOptions: FsEditMatchOptions,
   backupBeforeMutation: boolean,
   exec: ToolRunContext,
@@ -281,8 +289,13 @@ async function replaceInFile(
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
-  const oldValue = requiredForCommand(oldStr, 'old_str', 'str_replace', false)
-  const newValue = newStr ?? ''
+  const oldValue = resolveFsText(
+    requiredForCommand(oldStr, 'old_str', 'str_replace', false),
+    oldStrFormat ?? 'text',
+    'old_str',
+  )
+  if (oldValue.length === 0) throw new Error('Parameter `old_str` is empty for command: str_replace')
+  const newValue = newStr === undefined ? '' : resolveFsText(newStr, newStrFormat ?? 'text', 'new_str')
   let outcome
   try {
     outcome = await ctx.fs.editText(
@@ -311,11 +324,16 @@ async function insertInFile(
   path: string,
   insertLine: number | undefined,
   newStr: string | undefined,
+  newStrFormat: FsTextFormat | undefined,
   backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
   if (insertLine === undefined) throw new Error('Parameter `insert_line` is required for command: insert')
-  const value = requiredForCommand(newStr, 'new_str', 'insert')
+  const value = resolveFsText(
+    requiredForCommand(newStr, 'new_str', 'insert'),
+    newStrFormat ?? 'text',
+    'new_str',
+  )
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
@@ -365,9 +383,12 @@ function presentEditorCall(args: {
   command: 'view' | 'create' | 'str_replace' | 'insert'
   path: string
   file_text?: string
+  file_text_format?: FsTextFormat
   insert_line?: number
   new_str?: string
+  new_str_format?: FsTextFormat
   old_str?: string
+  old_str_format?: FsTextFormat
 }): ToolCallView {
   switch (args.command) {
     case 'view':
@@ -377,24 +398,35 @@ function presentEditorCall(args: {
         kind: 'read',
         locations: [{ path: args.path }],
       }
-    case 'create':
+    case 'create': {
+      const fileText = args.file_text === undefined
+        ? ''
+        : resolveFsText(args.file_text, args.file_text_format ?? 'text', 'file_text')
       return {
         card: 'diff',
         title: `create ${args.path}`,
-        diffs: [{ path: args.path, oldText: null, newText: args.file_text ?? '' }],
+        diffs: [{ path: args.path, oldText: null, newText: fileText }],
         locations: [{ path: args.path }],
       }
-    case 'str_replace':
+    }
+    case 'str_replace': {
+      const oldText = args.old_str === undefined
+        ? null
+        : resolveFsText(args.old_str, args.old_str_format ?? 'text', 'old_str')
+      const newText = args.new_str === undefined
+        ? ''
+        : resolveFsText(args.new_str, args.new_str_format ?? 'text', 'new_str')
       return {
         card: 'diff',
         title: `str_replace ${args.path}`,
         diffs: [{
           path: args.path,
-          oldText: args.old_str ?? null,
-          newText: args.new_str ?? '',
+          oldText,
+          newText,
         }],
         locations: [{ path: args.path }],
       }
+    }
     case 'insert':
       return {
         card: 'generic',
@@ -430,6 +462,11 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         type: 'string',
         description: 'Required parameter of `create` command, with the content of the file to be created.',
       },
+      file_text_format: {
+        type: 'string',
+        enum: ['text', 'escaped'],
+        description: 'file_text transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+      },
       insert_line: {
         type: 'integer',
         description: 'Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.',
@@ -438,9 +475,19 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         type: 'string',
         description: 'Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.',
       },
+      new_str_format: {
+        type: 'string',
+        enum: ['text', 'escaped'],
+        description: 'new_str transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+      },
       old_str: {
         type: 'string',
         description: 'Required parameter of `str_replace` command containing the string in `path` to replace.',
+      },
+      old_str_format: {
+        type: 'string',
+        enum: ['text', 'escaped'],
+        description: 'old_str transport. Defaults to text; escaped decodes exactly one strict escape layer.',
       },
       view_range: {
         type: 'array',
@@ -457,7 +504,10 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         case 'view':
           return viewPath(ctx, args.path, args.view_range, config.maxOutputChars, exec)
         case 'create':
-          return createFile(ctx, policy, args.path, args.file_text, config.backupBeforeMutation, exec)
+          return createFile(
+            ctx, policy, args.path, args.file_text, args.file_text_format,
+            config.backupBeforeMutation, exec,
+          )
         case 'str_replace':
           return replaceInFile(
             ctx,
@@ -465,6 +515,8 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             args.path,
             args.old_str,
             args.new_str,
+            args.old_str_format,
+            args.new_str_format,
             config.editMatchOptions,
             config.backupBeforeMutation,
             exec,
@@ -476,6 +528,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             args.path,
             args.insert_line,
             args.new_str,
+            args.new_str_format,
             config.backupBeforeMutation,
             exec,
           )

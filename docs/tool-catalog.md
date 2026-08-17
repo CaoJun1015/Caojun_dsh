@@ -537,9 +537,10 @@ Custom editing tool for viewing, creating and editing files
 * If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
 * The `create` command cannot be used if the specified `path` already exists as a file
 * If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
+* Text format parameters default to `text`: use the JSON-decoded string unchanged. JSON `"\n"` is a newline, while `"\\n"` is a literal backslash plus n. Choose `escaped` only to decode one additional strict layer
 
 Notes for using the `str_replace` command:
-* The `old_str` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
+* The `old_str` parameter must identify one unique region. Progressive matching can ignore outer search whitespace, per-line trailing whitespace, and full-width ASCII differences; approximate candidates are suggestions only
 * If the `old_str` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in `old_str` to make it unique
 * The `new_str` parameter should contain the edited lines that should replace the `old_str`
 
@@ -565,6 +566,14 @@ Notes for using the `str_replace` command:
       "type": "string",
       "description": "Required parameter of `create` command, with the content of the file to be created."
     },
+    "file_text_format": {
+      "type": "string",
+      "description": "file_text transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
     "insert_line": {
       "type": "integer",
       "description": "Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`."
@@ -573,9 +582,25 @@ Notes for using the `str_replace` command:
       "type": "string",
       "description": "Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert."
     },
+    "new_str_format": {
+      "type": "string",
+      "description": "new_str transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
     "old_str": {
       "type": "string",
       "description": "Required parameter of `str_replace` command containing the string in `path` to replace."
+    },
+    "old_str_format": {
+      "type": "string",
+      "description": "old_str transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     },
     "view_range": {
       "type": "array",
@@ -614,11 +639,27 @@ Edit an existing UTF-8 text file by replacing literal text.
     },
     "old_string": {
       "type": "string",
-      "description": "Literal text to replace. Must match exactly."
+      "description": "Literal text to replace. It must identify a unique match after the configured safe matching strategies."
     },
     "new_string": {
       "type": "string",
       "description": "Literal replacement text. Use an empty string to delete the match."
+    },
+    "old_string_format": {
+      "type": "string",
+      "description": "old_string transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
+    "new_string_format": {
+      "type": "string",
+      "description": "new_string transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     },
     "replace_all": {
       "type": "boolean",
@@ -700,6 +741,14 @@ Create or fully replace a UTF-8 text file.
     "content": {
       "type": "string",
       "description": "Full UTF-8 text content to write."
+    },
+    "content_format": {
+      "type": "string",
+      "description": "Text transport. Defaults to text (use the JSON-decoded string unchanged); escaped decodes exactly one layer of \\\\, \\n, \\r, and \\t.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     }
   },
   "required": [

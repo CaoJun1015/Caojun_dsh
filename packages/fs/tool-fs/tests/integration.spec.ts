@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -64,6 +64,37 @@ describe('default deployment (with dsh-fs-observation-policy)', () => {
       const result = await call('write', { file_path: 'new.txt', content: 'line one\nline two\n' })
       expect(result.isError).toBe(false)
       expect(await readFile(join(dir, 'new.txt'), 'utf8')).toBe('line one\nline two\n')
+    })
+
+    it('keeps text escapes literal and decodes one explicit escaped layer', async () => {
+      const literal = String.raw`C:\temp\file\n`
+      expect((await call('write', { file_path: 'literal.txt', content: literal })).isError).toBe(false)
+      expect(await readFile(join(dir, 'literal.txt'), 'utf8')).toBe(literal)
+
+      expect((await call('write', {
+        file_path: 'escaped.txt',
+        content: String.raw`one\ntwo\tend\\tail`,
+        content_format: 'escaped',
+      })).isError).toBe(false)
+      expect(await readFile(join(dir, 'escaped.txt'), 'utf8')).toBe('one\ntwo\tend\\tail')
+      expect((await call('write', {
+        file_path: 'single-layer.txt',
+        content: String.raw`\\n`,
+        content_format: 'escaped',
+      })).isError).toBe(false)
+      expect(await readFile(join(dir, 'single-layer.txt'), 'utf8')).toBe(String.raw`\n`)
+    })
+
+    it('rejects invalid escaped content before target or backup mutation', async () => {
+      const result = await call('write', {
+        file_path: 'invalid.txt',
+        content: String.raw`\q`,
+        content_format: 'escaped',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('unsupported escape \\q')
+      await expect(access(join(dir, 'invalid.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(access(join(dir, '.backups'))).rejects.toMatchObject({ code: 'ENOENT' })
     })
 
     it('rejects overwriting an existing file without reading it first', async () => {
@@ -142,6 +173,41 @@ describe('default deployment (with dsh-fs-observation-policy)', () => {
   })
 
   describe('edit → disk', () => {
+    it('applies text and escaped formats without guessing from content', async () => {
+      const path = join(dir, 'escapes.txt')
+      await writeFile(path, String.raw`literal \n and path C:\temp` + '\nnext')
+      expect((await call('read', { file_path: 'escapes.txt' })).isError).toBe(false)
+      expect((await call('edit', {
+        file_path: 'escapes.txt',
+        old_string: String.raw`\n`,
+        new_string: 'LITERAL',
+      })).isError).toBe(false)
+      expect((await call('edit', {
+        file_path: 'escapes.txt',
+        old_string: String.raw`\n`,
+        old_string_format: 'escaped',
+        new_string: String.raw`\t`,
+        new_string_format: 'escaped',
+      })).isError).toBe(false)
+      expect(await readFile(path, 'utf8')).toBe(String.raw`literal LITERAL and path C:\temp` + '\tnext')
+    })
+
+    it('rejects invalid escaped edit arguments before backup or target mutation', async () => {
+      const path = join(dir, 'invalid-edit.txt')
+      await writeFile(path, 'original')
+      expect((await call('read', { file_path: 'invalid-edit.txt' })).isError).toBe(false)
+      const beforeBackups = await readdir(join(dir, '.backups')).catch(() => [])
+      const result = await call('edit', {
+        file_path: 'invalid-edit.txt',
+        old_string: String.raw`\q`,
+        old_string_format: 'escaped',
+        new_string: 'x',
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('unsupported escape \\q')
+      expect(await readFile(path, 'utf8')).toBe('original')
+      expect(await readdir(join(dir, '.backups')).catch(() => [])).toEqual(beforeBackups)
+    })
     it('applies a unique literal replacement after a read', async () => {
       await writeFile(join(dir, 'a.txt'), 'hello world')
       await call('read', { file_path: 'a.txt' })

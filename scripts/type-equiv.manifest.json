@@ -1097,7 +1097,47 @@
     },
     {
       "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsBackupPolicy",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsBackupRef",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsWriteOptions",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsEditOptions",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
       "symbol": "FsWriteOutcome",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsEditMatchOptions",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsEditMatchStrategy",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsEditCandidate",
+      "source": "packages/fs/fs/src/types.ts"
+    },
+    {
+      "doc": "docs/subsystems/filesystem.md",
+      "symbol": "FsEditErrorDetails",
       "source": "packages/fs/fs/src/types.ts"
     },
     {

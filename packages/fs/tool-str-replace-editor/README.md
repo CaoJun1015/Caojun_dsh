@@ -10,10 +10,15 @@ Standalone model-facing `str_replace_editor` over `ctx.fs`. It can be composed w
 |---|---:|---|
 | `maxOutputChars` | `16000` | Prefix characters retained for file and directory views. |
 | `description` | Editor command guide | Model-facing tool description. |
+| `editMatchMode` | `progressive` | Safe cumulative matching, or `exact` for LF-normalized exact-only edits. |
+| `editCandidateLimit` | `3` | Maximum nearby candidates returned after a miss. |
+| `editCandidateMaxDistance` | `3` | Maximum Unicode-code-point edit distance for candidates. |
+| `editCandidatePreviewChars` | `160` | Maximum Unicode code points in each preview. |
+| `backupBeforeMutation` | `true` | Require the provider to back up an existing target before create/replace/insert mutation. |
 
 ## Tool
 
-The schema provides `view`, `create`, `str_replace`, and `insert` over absolute paths. File views use one-based line numbers and preserve content tabs, so displayed text remains valid literal replacement input; directory views omit hidden, dependency, and Python-cache entries and descend two levels. A metadata miss from `view`, `str_replace`, or `insert` records confirmed absence before returning `FS_NOT_FOUND`, so a later `create` can recover an externally deleted path through the mounted policy's guarded-create flow; absence never authorizes `str_replace` or `insert`. Replacement requires one unique literal match and reports errors only in the public `old_str` vocabulary. Insert follows the selected zero-based insertion boundary without adding an implicit trailing newline. Mutations preserve tabs outside the requested edit.
+The schema provides `view`, `create`, `str_replace`, and `insert` over absolute paths. `file_text_format`, `old_str_format`, and `new_str_format` default to `text`, which preserves JSON-decoded strings; `escaped` strictly decodes one additional layer of `\\`, `\n`, `\r`, and `\t`. File views use one-based line numbers and preserve content tabs. Replacement delegates to `ctx.fs.editText`, uses the same unique progressive strategies and candidate diagnostics as `edit`, and reports errors only in the public `old_str` vocabulary. Create, replace, and insert require provider backups for existing files by default, and success results expose the recovery path and byte count. Insert follows the selected zero-based boundary without adding an implicit trailing newline.
 
 ## Model Experience
 
@@ -35,7 +40,7 @@ Prefix-stable while the configured description and schema remain unchanged.
 
 #### What the model sees
 
-Views return numbered text or a shallow directory listing. Calls expose file locations, and create/replace calls expose diff cards to presentation surfaces. Mutations return concise confirmations. Long views keep their prefix and append a clipping notice.
+Views return numbered text or a shallow directory listing. Calls expose file locations, and create/replace calls expose diff cards to presentation surfaces. Mutation confirmations include a backup recovery path when an existing file changed; fallback replacements identify the strategy used. Long views keep their prefix and append a clipping notice.
 
 #### Token effect
 

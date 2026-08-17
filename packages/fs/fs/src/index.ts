@@ -28,6 +28,13 @@ import type {
 export {
   applyTextEdit,
 } from './edit-match.ts'
+export {
+  decodeEscapedText,
+  resolveFsText,
+} from './escaped-text.ts'
+export type {
+  FsTextFormat,
+} from './escaped-text.ts'
 export type {
   FsAppliedTextEdit,
 } from './edit-match.ts'

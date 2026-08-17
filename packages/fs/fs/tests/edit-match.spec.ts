@@ -13,6 +13,16 @@ function edit(content: string, oldString: string, newString = 'X', replaceAll = 
   return applyTextEdit(content, { oldString, newString, replaceAll, matchOptions: progressive }, 'story.md')
 }
 
+function getFsError(action: () => unknown): FsError {
+  try {
+    action()
+  } catch (error: unknown) {
+    if (error instanceof FsError) return error
+    throw error
+  }
+  throw new Error('expected filesystem edit to fail')
+}
+
 describe('applyTextEdit', () => {
   it('uses the first cumulative strategy that has matches', () => {
     expect(edit('before target after', 'target')).toMatchObject({ content: 'before X after', matchStrategy: 'exact' })
@@ -27,23 +37,23 @@ describe('applyTextEdit', () => {
   })
 
   it('never resolves an ambiguous fallback unless replaceAll is requested', () => {
-    expect(() => edit('Ａ Ａ', 'A')).toThrow(expect.objectContaining({
+    expect(getFsError(() => edit('Ａ Ａ', 'A'))).toMatchObject({
       code: 'FS_AMBIGUOUS_EDIT',
-      details: expect.objectContaining({ matchCount: 2, attemptedStrategies: ['exact', 'trimmed', 'lineTrailingWhitespace', 'fullWidthAscii'] }),
-    }))
+      details: { matchCount: 2, attemptedStrategies: ['exact', 'trimmed', 'lineTrailingWhitespace', 'fullWidthAscii'] },
+    })
     expect(edit('Ａ Ａ', 'A', 'B', true)).toMatchObject({ content: 'B B', replacements: 2, matchStrategy: 'fullWidthAscii' })
   })
 
   it('keeps exact mode exact', () => {
-    expect(() => applyTextEdit('ＡＢＣ', {
+    expect(getFsError(() => applyTextEdit('ＡＢＣ', {
       oldString: 'ABC',
       newString: 'X',
       replaceAll: false,
       matchOptions: { ...progressive, mode: 'exact' },
-    }, 'story.md')).toThrow(expect.objectContaining({
+    }, 'story.md'))).toMatchObject({
       code: 'FS_EDIT_NOT_FOUND',
-      details: expect.objectContaining({ attemptedStrategies: ['exact'] }),
-    }))
+      details: { attemptedStrategies: ['exact'] },
+    })
   })
 
   it('ranks Unicode-code-point candidates for equal-line-count windows', () => {
@@ -65,25 +75,25 @@ describe('applyTextEdit', () => {
   })
 
   it('enforces candidate and preview limits', () => {
-    expect(() => applyTextEdit('cat\ncap\ncan', {
+    expect(getFsError(() => applyTextEdit('cat\ncap\ncan', {
       oldString: 'car',
       newString: 'X',
       replaceAll: false,
       matchOptions: { ...progressive, candidateLimit: 2, candidatePreviewChars: 2 },
-    }, 'story.md')).toThrow(expect.objectContaining({
-      details: expect.objectContaining({
+    }, 'story.md'))).toMatchObject({
+      details: {
         candidates: [
-          expect.objectContaining({ line: 1, preview: 'c…' }),
-          expect.objectContaining({ line: 2, preview: 'c…' }),
+          { line: 1, distance: 1, preview: 'c…' },
+          { line: 2, distance: 1, preview: 'c…' },
         ],
-      }),
-    }))
+      },
+    })
   })
 
   it('rejects an empty search without producing a candidate', () => {
-    expect(() => edit('content', '   ')).toThrow(expect.objectContaining({
+    expect(getFsError(() => edit('content', '   '))).toMatchObject({
       code: 'FS_EDIT_NOT_FOUND',
-      details: expect.objectContaining({ candidates: [] }),
-    }))
+      details: { candidates: [] },
+    })
   })
 })

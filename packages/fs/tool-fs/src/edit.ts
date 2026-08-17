@@ -10,6 +10,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
 import type { FsEditMatchOptions, FsEditMatchStrategy } from '@deepseek-ai/dsh-fs'
+import { resolveFsText } from '@deepseek-ai/dsh-fs'
+import type { FsTextFormat } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
 import { formatEditFsError, remediateFsError } from './error.ts'
@@ -33,6 +35,8 @@ interface EditToolArgs {
   file_path: string
   old_string: string
   new_string: string
+  old_string_format?: FsTextFormat
+  new_string_format?: FsTextFormat
   replace_all?: boolean
   sandbox_permissions?: string
   justification?: string
@@ -45,14 +49,23 @@ interface EditToolArgs {
  * @param args - the schema-validated raw tool arguments.
  * @returns the camelCased input with `replace_all` defaulted to false.
  */
-export function parseEditArgs(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): EditInput {
+export function parseEditArgs(args: {
+  file_path: string
+  old_string: string
+  new_string: string
+  old_string_format?: FsTextFormat
+  new_string_format?: FsTextFormat
+  replace_all?: boolean
+}): EditInput {
   if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
-  if (args.old_string.length === 0) throw new Error('old_string must be a non-empty string')
-  if (args.old_string === args.new_string) throw new Error('old_string and new_string must differ')
+  const oldString = resolveFsText(args.old_string, args.old_string_format ?? 'text', 'old_string')
+  const newString = resolveFsText(args.new_string, args.new_string_format ?? 'text', 'new_string')
+  if (oldString.length === 0) throw new Error('old_string must be a non-empty string')
+  if (oldString === newString) throw new Error('old_string and new_string must differ')
   return {
     filePath: args.file_path,
-    oldString: args.old_string,
-    newString: args.new_string,
+    oldString,
+    newString,
     replaceAll: args.replace_all ?? false,
   }
 }
@@ -61,6 +74,8 @@ export function parseEditArgs(args: { file_path: string; old_string: string; new
  * Format an edit success (single-match or replace-all) as a Claude-style model-facing message.
  * @param displayPath - the backend-resolved path shown to the model.
  * @param replaceAll - selects the all-occurrences wording over the single-replacement one.
+ * @param strategy - authoritative matching strategy used by the provider.
+ * @param backup - model-safe recovery path and byte count, or null.
  * @returns the confirmation sentence the model sees as the tool result.
  */
 export function formatEditOutput(
@@ -82,6 +97,8 @@ export function formatEditOutput(
  * Register the `edit` tool and its system-prompt guidance.
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
+ * @param matchOptions - provider matching and candidate-diagnostic policy.
+ * @param backupBeforeMutation - whether existing files require a provider backup.
  */
 export function applyEditTool(
   ctx: Context,
@@ -92,7 +109,7 @@ export function applyEditTool(
   ctx.systemPrompt.section({
     name: 'tool:edit',
     order: 102,
-    text: 'Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+    text: 'Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. String formats default to text, which uses JSON-decoded strings unchanged: JSON "\\n" is a newline, while "\\\\n" is a literal backslash plus n. Select escaped only to decode one additional layer. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
   })
 
   ctx.tools.register(defineTool({
@@ -102,6 +119,14 @@ export function applyEditTool(
       file_path: { type: 'string', required: true, description: 'Path to edit, resolved by the filesystem backend.' },
       old_string: { type: 'string', required: true, description: 'Literal text to replace. It must identify a unique match after the configured safe matching strategies.' },
       new_string: { type: 'string', required: true, description: 'Literal replacement text. Use an empty string to delete the match.' },
+      old_string_format: {
+        type: 'string', enum: ['text', 'escaped'],
+        description: 'old_string transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+      },
+      new_string_format: {
+        type: 'string', enum: ['text', 'escaped'],
+        description: 'new_string transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+      },
       replace_all: { type: 'boolean', description: 'Replace all matches. Defaults to false; when false, old_string must appear exactly once.' },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
     },
@@ -196,10 +221,12 @@ export function applyEditTool(
     // from the call args. `oldText: old_string || null` matches claude-agent-acp's Edit arm;
     // new_string is a required arg here, so it maps straight to newText.
     presentCall(args): DiffCallView {
+      const oldText = resolveFsText(args.old_string, args.old_string_format ?? 'text', 'old_string')
+      const newText = resolveFsText(args.new_string, args.new_string_format ?? 'text', 'new_string')
       return {
         card: 'diff',
         title: `Edit ${args.file_path}`,
-        diffs: [{ path: args.file_path, oldText: args.old_string || null, newText: args.new_string }],
+        diffs: [{ path: args.file_path, oldText: oldText || null, newText }],
         locations: [{ path: args.file_path }],
       }
     },

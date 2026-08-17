@@ -17,10 +17,12 @@ Status: implemented
 | 工具 | 我们的 schema | Claude Code | OpenCode | 说明 |
 |---|---|---|---|---|
 | `read` | `read(file_path, offset?, limit?)` | `Read(file_path, offset?, limit?, pages?)` | `read(filePath, offset?, limit?)` | 仅支持文件；`offset` 从 1 开始；首版不支持图片、PDF 或多模态内容。 |
-| `write` | `write(file_path, content)` | `Write(file_path, content)` | `write(content, filePath)` | 创建或覆盖 UTF-8 文本。在默认 fs-observation-policy 下，更新现有文件前必须先观测；创建新文件则不需要。 |
-| `edit` | `edit(file_path, old_string, new_string, replace_all?)` | `Edit(file_path, old_string, new_string, replace_all?)` | `edit(filePath, oldString, newString, replaceAll?)` | 字面字符串替换；默认要求唯一匹配；在默认 fs-observation-policy 下必须先观测（任意窗口读取均算作观测）。 |
+| `write` | `write(file_path, content, content_format?)` | `Write(file_path, content)` | `write(content, filePath)` | 创建或覆盖 UTF-8 文本。format 默认使用无损 `text`；`escaped` 显式解码一层严格转义。现有目标默认先备份。 |
+| `edit` | `edit(file_path, old_string, new_string, old_string_format?, new_string_format?, replace_all?)` | `Edit(file_path, old_string, new_string, replace_all?)` | `edit(filePath, oldString, newString, replaceAll?)` | 安全渐进字符串替换；默认要求唯一匹配。format 默认使用无损 `text`，现有目标会备份。 |
 
 schema 使用 snake_case 字段名（`file_path`、`old_string`、`new_string`、`replace_all`），与 Claude Code 及现有 DeepSeek Harness 工具 schema 示例保持一致。消费方包将这些面向模型的名称转换为 `ctx.fs` 调用和 `fs/*` 事件分发。
+
+后续匹配、提供方备份和显式 format 决策由[文件系统变更安全](2026-08-17-filesystem-mutation-safety.md)负责。
 
 ## 工具 schema
 
@@ -48,6 +50,7 @@ schema 使用 snake_case 字段名（`file_path`、`old_string`、`new_string`�
 
 - `file_path: string`——必填。要写入的路径，由 `ctx.fs` 解析。
 - `content: string`——必填。要写入的完整 UTF-8 文本内容。
+- `content_format?: 'text' | 'escaped'`——可选。默认为无损 JSON 解析文本；`escaped` 严格额外解码一层。
 
 在默认 fs-observation-policy 下，使用 `write` 更新已有文件需要同一执行上下文先前对该文件有过一次观测（read/write/edit）；`dsh-fs-observation-policy` 插件将观测到的版本作为 `fs/write-intent` 上的陈旧版本防护提供。创建新文件不需要先前观测。如果策略插件不存在，`write` 是由裸提供方无条件执行的创建或覆盖操作。
 
@@ -62,11 +65,13 @@ schema 不将 `expected_hash`、`expected_version` 或 `create_only` 作为面�
 - `file_path: string`——必填。要编辑的路径，由 `ctx.fs` 解析。
 - `old_string: string`——必填。要替换的字面文本。首次实现中空字符串无效。
 - `new_string: string`——必填。字面替换文本；空字符串表示删除匹配内容。
+- `old_string_format?: 'text' | 'escaped'`——可选。`old_string` 的传输格式，默认为 `text`。
+- `new_string_format?: 'text' | 'escaped'`——可选。`new_string` 的传输格式，默认为 `text`。
 - `replace_all?: boolean`——可选。默认为 false。为 false 时，`old_string` 必须恰好匹配一处。
 
 `edit` 要求同一执行上下文先前观测过该文件（任何窗口化的 read 都算——授权取决于观测到的版本是否仍为最新，而不要求查看全文），或该上下文先前对该文件执行过 write/edit。`dsh-fs-observation-policy` 策略插件推导所有者，并将记录的版本作为陈旧版本防护提供；提供方的变更锁会强制执行该防护。
 
-首次实现拒绝 Codex 风格的 patch 语法和多模式 edit API。它使用一种严格的字面替换模式，使面向模型的约定保持简单，并让后端掌控精确匹配、重复匹配、行尾和陈旧版本的语义。
+该工具拒绝 Codex 风格的 patch 语法和多模式 edit API。后端负责安全渐进匹配、歧义、行尾、备份和陈旧版本语义；format 字段只影响显式字符串解码。
 
 ## 结果形状
 
@@ -77,8 +82,8 @@ schema 不将 `expected_hash`、`expected_version` 或 `create_only` 作为面�
 | 工具 | `tool-fs` 使用的结构化 `ctx.fs` 结果 | 默认模型投影 |
 |---|---|---|
 | `read` | 返回的行、返回行数、总行数、目标显示路径、文件版本、部分视图标记 | 带行号的文本及分页页脚 |
-| `write` | 创建/更新操作、目标显示路径、新文件版本 | 简洁的创建/更新成功文本 |
-| `edit` | 替换次数、全量替换标记、目标显示路径、新文件版本 | 简洁的编辑成功文本 |
+| `write` | 创建/更新操作、目标显示路径、前后文本、备份路径/字节数 | 简洁的创建/更新文本；有备份时附恢复路径 |
+| `edit` | 前后文本、匹配策略、目标显示路径、备份路径/字节数 | 简洁编辑文本；适用时附恢复路径和降级警告 |
 
 结构化结果不会重复模型参数（如 `file_path`、`old_string` 或 `content`），除非后端已将其解析为新信息（如 `displayPath`、`targetKey` 或新版本）。以节省 token 为目的的截断属于模型投影的职责，而非后端规范结果的一部分。
 
@@ -99,7 +104,7 @@ schema 测试固定每个工具的必填/可选参数集、空 `old_string` 拒�
 
 ## 曾考虑的替代方案
 
-- **Codex 风格的 patch 语法或多模式 edit API**：否决。一种严格的字面替换模式使面向模型的约定保持简单，并让后端掌控精确匹配、重复匹配、行尾和陈旧版本的语义。
+- **Codex 风格的 patch 语法或多模式 edit API**：否决。单一替换操作让面向模型的约定保持精简，同时由后端负责匹配、歧义、行尾、备份和陈旧版本语义。
 - **camelCase 参数名（OpenCode 风格）**：snake_case 与 Claude Code 及现有 harness 工具 schema 示例一致，且命名一旦发布即成为公开 API。
 - **面向模型的 `expected_hash` / `expected_version` / `create_only` 参数**：否决。陈旧检查由后端产生的版本和策略插件的观测状态驱动，从不依赖模型复制的脆弱令牌。
 

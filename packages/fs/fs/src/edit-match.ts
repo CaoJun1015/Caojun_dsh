@@ -141,7 +141,7 @@ function boundedLevenshtein(left: string, right: string, maxDistance: number): n
     current[0] = row
     const start = Math.max(1, row - maxDistance)
     const end = Math.min(b.length, row + maxDistance)
-    let rowMinimum = current[0] ?? maxDistance + 1
+    let rowMinimum = current[0]
     for (let column = start; column <= end; column += 1) {
       current[column] = Math.min(
         (previous[column] ?? maxDistance + 1) + 1,

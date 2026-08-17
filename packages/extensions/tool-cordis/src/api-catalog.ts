@@ -628,15 +628,15 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'one entry per direct child, in stable name order.',
       },
       {
-        signature: 'abstract writeText( target: FsTarget, content: string, expected?: FsWriteIntent, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsWriteOutcome>',
-        description: 'Atomically create or replace UTF-8 text. `expected` guards intent and staleness; omission allows unconditional overwrite.',
-        parameters: [{ name: 'target', description: 'the resolved target to write.' }, { name: 'content', description: 'the full new file content.' }, { name: 'expected', description: 'the write intent guarding the write; omit for unconditional.' }, { name: 'signal', description: 'aborts before atomic publication takes effect.' }, { name: 'sandboxPolicy', description: 'the per-call mode and workspace root this write runs under; a sandboxing backend fences the write by it, the bare backend ignores it. Omit to leave the backend its own default.' }],
+        signature: 'abstract writeText( target: FsTarget, content: string, options: FsWriteOptions, ): Promise<FsWriteOutcome>',
+        description: 'Atomically create or replace UTF-8 text. `options.intent` guards intent and staleness; omission of the intent allows unconditional overwrite.',
+        parameters: [{ name: 'target', description: 'the resolved target to write.' }, { name: 'content', description: 'the full new file content.' }, { name: 'options', description: 'write intent, backup policy, cancellation, and the per-call mode and workspace root this write runs under; a sandboxing backend fences the write by it, the bare backend ignores it. Omit to leave the backend its own default.' }],
         returns: 'the outcome, including the version the write produced.',
       },
       {
-        signature: 'abstract editText( target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsEditOutcome>',
+        signature: 'abstract editText( target: FsTarget, edit: FsEditRequest, options: FsEditOptions, ): Promise<FsEditOutcome>',
         description: 'Atomically edit literal text. When supplied, the version guard is checked before matching so stale content reports `FS_STALE_VERSION`; omission edits the current content without a freshness precondition.',
-        parameters: [{ name: 'target', description: 'the resolved target to edit.' }, { name: 'edit', description: 'the literal search/replace request.' }, { name: 'expected', description: 'the version guard; omit for an unconditional edit.' }, { name: 'signal', description: 'aborts before atomic publication takes effect.' }, { name: 'sandboxPolicy', description: 'the per-call mode and workspace root this edit runs under; a sandboxing backend fences the edit by it, the bare backend ignores it. Omit to leave the backend its own default.' }],
+        parameters: [{ name: 'target', description: 'the resolved target to edit.' }, { name: 'edit', description: 'the literal search/replace request.' }, { name: 'options', description: 'version guard, backup policy, cancellation, and the per-call mode and workspace root this edit runs under; a sandboxing backend fences the edit by it, the bare backend ignores it. Omit to leave the backend its own default.' }],
         returns: 'the outcome, including the version the edit produced.',
       },
     ],
@@ -3046,16 +3046,36 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface FinishReasonMap {\n    \'stop\': {\n        kind: \'stop\';\n    };\n    \'tool-calls\': {\n        kind: \'tool-calls\';\n    };\n    \'max-tokens\': {\n        kind: \'max-tokens\';\n    };\n    \'aborted\': {\n        kind: \'aborted\';\n        failure: LlmFailure;\n    };\n    \'error\': {\n        kind: \'error\';\n        failure: LlmFailure;\n    };\n}',
   },
   {
+    name: 'FsBackupPolicy',
+    declaration: 'export type FsBackupPolicy = \'required\' | \'disabled\';',
+  },
+  {
+    name: 'FsBackupRef',
+    declaration: 'export interface FsBackupRef {\n    path: string;\n    bytes: number;\n    sourceVersion: FsVersion;\n}',
+  },
+  {
     name: 'FsDirEntry',
     declaration: 'export interface FsDirEntry {\n    name: string;\n    type: \'file\' | \'directory\' | \'other\';\n    target: FsTarget;\n    version?: FsVersion;\n    size?: number;\n}',
   },
   {
+    name: 'FsEditMatchOptions',
+    declaration: 'export interface FsEditMatchOptions {\n    mode: \'exact\' | \'progressive\';\n    candidateLimit: number;\n    candidateMaxDistance: number;\n    candidatePreviewChars: number;\n}',
+  },
+  {
+    name: 'FsEditMatchStrategy',
+    declaration: 'export type FsEditMatchStrategy = \'exact\' | \'trimmed\' | \'lineTrailingWhitespace\' | \'fullWidthAscii\';',
+  },
+  {
+    name: 'FsEditOptions',
+    declaration: 'export interface FsEditOptions {\n    version?: FsVersion;\n    backup: FsBackupPolicy;\n    signal?: AbortSignal;\n    sandboxPolicy?: import(\'@deepseek-ai/dsh-sandbox\').SandboxExecutionPolicy;\n}',
+  },
+  {
     name: 'FsEditOutcome',
-    declaration: 'export interface FsEditOutcome {\n    version: FsVersion;\n    before: string;\n    after: string;\n}',
+    declaration: 'export interface FsEditOutcome {\n    version: FsVersion;\n    before: string;\n    after: string;\n    matchStrategy: FsEditMatchStrategy;\n    backup: FsBackupRef | null;\n}',
   },
   {
     name: 'FsEditRequest',
-    declaration: 'export interface FsEditRequest {\n    oldString: string;\n    newString: string;\n    replaceAll: boolean;\n}',
+    declaration: 'export interface FsEditRequest {\n    oldString: string;\n    newString: string;\n    replaceAll: boolean;\n    matchOptions?: FsEditMatchOptions;\n}',
   },
   {
     name: 'FsInfo',
@@ -3086,8 +3106,12 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export type FsWriteIntent = {\n    kind: \'createIfAbsent\';\n} | {\n    kind: \'replaceIfVersion\';\n    version: FsVersion;\n};',
   },
   {
+    name: 'FsWriteOptions',
+    declaration: 'export interface FsWriteOptions {\n    intent?: FsWriteIntent;\n    backup: FsBackupPolicy;\n    signal?: AbortSignal;\n    sandboxPolicy?: import(\'@deepseek-ai/dsh-sandbox\').SandboxExecutionPolicy;\n}',
+  },
+  {
     name: 'FsWriteOutcome',
-    declaration: 'export interface FsWriteOutcome {\n    operation: \'create\' | \'update\';\n    version: FsVersion;\n    before: string | null;\n    after: string;\n}',
+    declaration: 'export interface FsWriteOutcome {\n    operation: \'create\' | \'update\';\n    version: FsVersion;\n    before: string | null;\n    after: string;\n    backup: FsBackupRef | null;\n}',
   },
   {
     name: 'GenerateOptions',

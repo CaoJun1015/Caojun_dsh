@@ -9,7 +9,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
-import type {} from '@deepseek-ai/dsh-fs'
+import { resolveFsText } from '@deepseek-ai/dsh-fs'
+import type { FsTextFormat } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
 import { remediateFsError } from './error.ts'
@@ -22,9 +23,17 @@ import type { FsSandboxController } from './sandbox.ts'
  * @param args - the schema-validated raw tool arguments.
  * @returns the camelCased input; `content` passes through untouched.
  */
-export function parseWriteArgs(args: { file_path: string; content: string }): { filePath: string; content: string } {
+export function parseWriteArgs(args: {
+  file_path: string
+  content: string
+  content_format?: FsTextFormat
+}): { filePath: string; content: string } {
   if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
-  return { filePath: args.file_path, content: args.content }
+  const contentFormat = args.content_format ?? 'text'
+  return {
+    filePath: args.file_path,
+    content: resolveFsText(args.content, contentFormat, 'content'),
+  }
 }
 
 /**
@@ -56,6 +65,7 @@ ${verb} file
 interface WriteToolArgs {
   file_path: string
   content: string
+  content_format?: FsTextFormat
   sandbox_permissions?: string
   justification?: string
 }
@@ -64,12 +74,13 @@ interface WriteToolArgs {
  * Register the `write` tool and its system-prompt guidance.
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
+ * @param backupBeforeMutation - whether existing files require a provider backup.
  */
 export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backupBeforeMutation: boolean): void {
   ctx.systemPrompt.section({
     name: 'tool:write',
     order: 101,
-    text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.',
+    text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes. content_format defaults to text, which uses the JSON-decoded string unchanged: JSON "\\n" is a newline, while "\\\\n" is a literal backslash plus n. Select escaped only to decode one additional layer of \\\\, \\n, \\r, or \\t.',
   })
 
   ctx.tools.register(defineTool({
@@ -78,6 +89,11 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
     parameters: {
       file_path: { type: 'string', required: true, description: 'Path to write, resolved by the filesystem backend.' },
       content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
+      content_format: {
+        type: 'string',
+        enum: ['text', 'escaped'],
+        description: 'Text transport. Defaults to text (use the JSON-decoded string unchanged); escaped decodes exactly one layer of \\\\, \\n, \\r, and \\t.',
+      },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
     },
     output: {
@@ -158,10 +174,11 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
     // Pure display: a diff card. A call-time presenter has no access to prior
     // file content, so `oldText: null` also represents an overwrite here.
     presentCall(args): DiffCallView {
+      const content = resolveFsText(args.content, args.content_format ?? 'text', 'content')
       return {
         card: 'diff',
         title: `Write ${args.file_path}`,
-        diffs: [{ path: args.file_path, oldText: null, newText: args.content }],
+        diffs: [{ path: args.file_path, oldText: null, newText: content }],
         locations: [{ path: args.file_path }],
       }
     },
@@ -171,7 +188,11 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
     presentResult(args, result: ToolResult): DiffResultView | undefined {
       if (result.isError) return undefined
       const diffs = diffsFromMeta(result.meta)
-        ?? [{ path: args.file_path, oldText: null, newText: args.content }]
+        ?? [{
+          path: args.file_path,
+          oldText: null,
+          newText: resolveFsText(args.content, args.content_format ?? 'text', 'content'),
+        }]
       return { card: 'diff', title: `Write ${args.file_path}`, diffs }
     },
   }))

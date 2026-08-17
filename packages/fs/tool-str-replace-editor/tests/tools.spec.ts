@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -572,6 +572,43 @@ describe('tool-str-replace-editor', () => {
     })
     expect(insert.isError).toBe(true)
     expect(text(insert)).toContain('backend write failed')
+  })
+
+  it('uses explicit text formats and rejects invalid escape layers before mutation', async () => {
+    const { ctx, root, owner } = await setup()
+    const literal = join(root, 'literal.txt')
+    const escaped = join(root, 'escaped.txt')
+    expect((await call(ctx, owner, {
+      command: 'create', path: literal, file_text: String.raw`one\ntwo`,
+    })).isError).toBe(false)
+    expect(await readFile(literal, 'utf8')).toBe(String.raw`one\ntwo`)
+
+    expect((await call(ctx, owner, {
+      command: 'create',
+      path: escaped,
+      file_text: String.raw`one\ntwo`,
+      file_text_format: 'escaped',
+    })).isError).toBe(false)
+    expect(await readFile(escaped, 'utf8')).toBe('one\ntwo')
+    expect((await call(ctx, owner, {
+      command: 'str_replace',
+      path: escaped,
+      old_str: String.raw`\n`,
+      old_str_format: 'escaped',
+      new_str: String.raw`\t`,
+      new_str_format: 'escaped',
+    })).isError).toBe(false)
+    expect(await readFile(escaped, 'utf8')).toBe('one\ttwo')
+
+    const invalid = join(root, 'invalid.txt')
+    const invalidCreate = await call(ctx, owner, {
+      command: 'create', path: invalid, file_text: String.raw`\q`, file_text_format: 'escaped',
+    })
+    expect(invalidCreate.isError).toBe(true)
+    expect(text(invalidCreate)).toContain('unsupported escape \\q')
+    await expect(access(invalid)).rejects.toMatchObject({ code: 'ENOENT' })
+    const backups = await readdir(join(root, '.backups'), { recursive: true }).catch(() => [])
+    expect(backups.some(name => name.includes('invalid'))).toBe(false)
   })
 
   it('rejects invalid plugin config', () => {

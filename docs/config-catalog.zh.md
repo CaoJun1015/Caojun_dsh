@@ -587,6 +587,26 @@ export interface Config {
 
 来源：[`packages/e2b/e2b/src/index.ts:43`](../packages/e2b/e2b/src/index.ts)
 
+<a id="deepseek-aidsh-fs-e2b"></a>
+
+## `@deepseek-ai/dsh-fs-e2b`
+
+需要：`e2b`
+
+```ts config-catalog
+/** Configuration for private backups inside the E2B sandbox. */
+export interface Config {
+  /** Whether required mutation backups can be created. Defaults to true. */
+  backupEnabled?: boolean
+  /** Sandbox-local private backup root. Defaults to `/tmp/dsh-backups`. */
+  backupRoot?: string
+  /** Number of newest backups retained per canonical target. Defaults to 3. */
+  backupVersionsPerTarget?: number
+}
+```
+
+来源：[`packages/e2b/fs-e2b/src/index.ts:40`](../packages/e2b/fs-e2b/src/index.ts)
+
 <a id="deepseek-aidsh-fs-local"></a>
 
 ## `@deepseek-ai/dsh-fs-local`
@@ -601,10 +621,16 @@ export interface Config {
    * runtime's safe allocation/decode maximum. Defaults to 10 MiB.
    */
   diffBasisMaxBytes?: number
+  /** Whether required mutation backups can be created. Defaults to true. */
+  backupEnabled?: boolean
+  /** Private provider-owned backup directory. Defaults to the DSH home backups directory. */
+  backupRoot?: string
+  /** Number of newest backups retained per canonical target. Defaults to 3. */
+  backupVersionsPerTarget?: number
 }
 ```
 
-来源：[`packages/fs/fs-local/src/index.ts:41`](../packages/fs/fs-local/src/index.ts)
+来源：[`packages/fs/fs-local/src/index.ts:44`](../packages/fs/fs-local/src/index.ts)
 
 <a id="deepseek-aidsh-fs-sandbox"></a>
 
@@ -2391,6 +2417,16 @@ export interface Config {
   readMaxBytes?: number
   /** Files at or above this size stream instead of loading whole into memory. */
   readStreamMinSize?: number
+  /** Literal edit matching policy. Defaults to safe progressive matching. */
+  editMatchMode?: 'progressive' | 'exact'
+  /** Maximum nearby candidates returned after an edit miss. */
+  editCandidateLimit?: number
+  /** Maximum Unicode-code-point edit distance for nearby candidates. */
+  editCandidateMaxDistance?: number
+  /** Maximum Unicode code points shown in each nearby-candidate preview. */
+  editCandidatePreviewChars?: number
+  /** Require provider backup before replacing an existing file. Defaults to true. */
+  backupBeforeMutation?: boolean
 }
 ```
 
@@ -2586,10 +2622,20 @@ export interface Config {
   maxOutputChars?: number
   /** Model-facing tool description. */
   description?: string
+  /** Literal edit matching policy. Defaults to safe progressive matching. */
+  editMatchMode?: 'progressive' | 'exact'
+  /** Maximum nearby candidates returned after an edit miss. */
+  editCandidateLimit?: number
+  /** Maximum Unicode-code-point edit distance for nearby candidates. */
+  editCandidateMaxDistance?: number
+  /** Maximum Unicode code points retained in each candidate preview. */
+  editCandidatePreviewChars?: number
+  /** Require provider backup before replacing an existing file. Defaults to true. */
+  backupBeforeMutation?: boolean
 }
 ```
 
-来源：[`packages/fs/tool-str-replace-editor/src/index.ts:497`](../packages/fs/tool-str-replace-editor/src/index.ts)
+来源：[`packages/fs/tool-str-replace-editor/src/index.ts:545`](../packages/fs/tool-str-replace-editor/src/index.ts)
 
 <a id="deepseek-aidsh-tool-subagent"></a>
 
@@ -3067,7 +3113,6 @@ export interface Config {
 - `@deepseek-ai/dsh-command-goal` — 需要 `commands` · `goals`（[`packages/goal/command-goal/src/index.ts`](../packages/goal/command-goal/src/index.ts)）
 - `@deepseek-ai/dsh-commands`（[`packages/interaction/commands/src/index.ts`](../packages/interaction/commands/src/index.ts)）
 - `@deepseek-ai/dsh-cordis-client-runner`（[`packages/extensions/cordis-client-runner/src/index.ts`](../packages/extensions/cordis-client-runner/src/index.ts)）
-- `@deepseek-ai/dsh-fs-e2b` — 需要 `e2b`（[`packages/e2b/fs-e2b/src/index.ts`](../packages/e2b/fs-e2b/src/index.ts)）
 - `@deepseek-ai/dsh-fs-observation-policy`（[`packages/fs/fs-observation-policy/src/index.ts`](../packages/fs/fs-observation-policy/src/index.ts)）
 - `@deepseek-ai/dsh-goal-round-driver` — 需要 `agents` · `goals` · `sessions`（[`packages/goal/goal-round-driver/src/index.ts`](../packages/goal/goal-round-driver/src/index.ts)）
 - `@deepseek-ai/dsh-host-directory-picker-auto` — 需要 `webServer` · `loader`（[`packages/host/directory-picker-auto/src/index.ts`](../packages/host/directory-picker-auto/src/index.ts)）

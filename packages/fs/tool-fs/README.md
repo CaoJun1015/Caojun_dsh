@@ -26,6 +26,11 @@ All keys are optional; the defaults are the shipped read caps.
 | `readMaxLineLength` | `2000` | Characters kept per line before truncation (the suffix names the cap). |
 | `readMaxBytes` | `51200` | Byte cap on one `read` call's selected lines; overflow ends the window with a "capped" footer. |
 | `readStreamMinSize` | `10485760` | Files at or above this size (or with unknown size) stream instead of loading whole into memory. |
+| `editMatchMode` | `progressive` | Safe cumulative matching, or `exact` for LF-normalized exact-only edits. |
+| `editCandidateLimit` | `3` | Maximum nearby candidates returned after an edit miss. |
+| `editCandidateMaxDistance` | `3` | Maximum Unicode-code-point edit distance for candidates. |
+| `editCandidatePreviewChars` | `160` | Maximum Unicode code points shown per candidate. |
+| `backupBeforeMutation` | `true` | Require provider backup before changing an existing file. |
 
 ## Tools (schemas per [the filesystem tool schemas Agent Note](../../../.agents/notes/implemented/feature/2026-06-17-filesystem-tool-schemas.md))
 
@@ -33,12 +38,12 @@ All keys are optional; the defaults are the shipped read caps.
 |---|---|---|
 | `read` | `file_path`, `offset?`, `limit?` | Line-numbered UTF-8 content with a pagination footer. `offset` is 1-based; `limit` defaults to and caps at the configured `readLimit` (2000). |
 | `read_image` | `file_path` | Reads a PNG/JPEG/WebP/GIF file through the bounded byte seam, persists it through `ctx.attachments.saveImage`, and returns an image block beside a small metadata envelope. It succeeds only when the exact routed model declares image input. |
-| `write` | `file_path`, `content` | Create or fully replace a file. With the policy plugin: overwriting an existing file requires a prior `read` at the unchanged version; creating a new file does not. Without it: unconditional. |
-| `edit` | `file_path`, non-empty `old_string`, `new_string`, `replace_all?` | Literal replacement; unique match required unless `replace_all` is true. With the policy plugin: requires a prior `read` (any window) and the file unchanged since. Without it: unconditional. |
+| `write` | `file_path`, `content`, `content_format?` | Create or fully replace a file. Format defaults to `text`; `escaped` decodes one strict additional escape layer. Existing files are backed up by default. |
+| `edit` | `file_path`, non-empty `old_string`, `new_string`, `old_string_format?`, `new_string_format?`, `replace_all?` | Unique safe progressive replacement by default. Formats default to `text`; `escaped` is explicit. Existing files are backed up before publication. |
 
 Field names are snake_case to match Claude Code and existing harness tool schemas.
 
-Canonical successes are `read` → `{ path, offset, lines: [{ number, text }], totalLines }`, `read_image` → `{ path, image: { attachmentId, mediaType, bytes, width, height, name? } }`, `write` → `{ path, operation: 'create' | 'update', before: string | null, after }`, and `edit` → `{ path, before, after }`. Native renderers preserve the line-numbered read and mutation acknowledgements below. `write`/`edit` derive replayable diff-card metadata, and `read` derives a replayable read-card window `{ path, offset, lines, totalLines, lang? }`, from these canonical values; the canonical values themselves are execution-local and are not added to `tool/result`, only the derived presentation metadata is persisted.
+Canonical successes are `read` → `{ path, offset, lines, totalLines }`, `read_image` → `{ path, image }`, `write` → `{ path, operation, before, after, backup }`, and `edit` → `{ path, before, after, match_strategy, backup }`. `backup` is `null` for creation/disabled backup or `{ path, bytes }` for recovery; provider version tokens stay internal. Native renderers preserve the line-numbered read and mutation acknowledgements below. Only derived presentation metadata is persisted to `tool/result`.
 
 ## The tool is the executor; policy is an event gate
 
@@ -46,8 +51,8 @@ The tools do **not** inject a policy service or inspect any cache. Each tool res
 
 - **read** — one `ctx.fs.stat` (type + size routing + version), then `readText`/`streamText`, then builds the line window, then emits `fs/observed` with a plain `ctx.emit`. (1 stat.)
 - **read_image** — validates the argument, extension, attachment availability, deployment media types, and the image-capable route before any I/O; then one `ctx.fs.stat` (recording an `absent` observation for a missing target, like `read`), a bounded `ctx.fs.readBytes` capped at the smaller of `imageLimits.maxImageBytes` and `imageLimits.maxMessageImageBytes` (the result is one message carrying one image), `attachments.saveImage` (content-addressed, so the image block references a durably committed object by the time `tool/result` is appended), and finally `fs/observed`. (1 stat.)
-- **write** — `ctx.waterfall('fs/write-intent', target, exec, () => undefined)` for the optional guard, then `ctx.fs.writeText(target, content, intent)`, then `fs/observed`. (0 stat.)
-- **edit** — `ctx.waterfall('fs/edit-intent', target, exec, () => undefined)` for the optional guard, then `ctx.fs.editText(target, edit, intent)`, then `fs/observed`. (0 stat.)
+- **write** — strictly resolves the selected text format, obtains the optional intent, then calls `ctx.fs.writeText(target, content, { intent?, backup, signal, sandboxPolicy? })` and emits `fs/observed`. Invalid escapes fail before resolution or backup. (0 stat.)
+- **edit** — strictly resolves both selected text formats, obtains the optional version, then calls `ctx.fs.editText(target, edit, { version?, backup, signal, sandboxPolicy? })` and emits `fs/observed`. Matching and diagnostics stay provider-shared. (0 stat.)
 
 The tool passes `exec` (the tool-execution context) as the opaque `actor` on every dispatch. The default thunks return `undefined` (the unconstrained bare provider). When `@deepseek-ai/dsh-fs-observation-policy` is loaded it occupies the single decision slot — returning `createIfAbsent`/`replaceIfVersion`/`{ version }` or throwing `FS_NOT_OBSERVED` — and records on `fs/observed`. Backend errors (`FsError`) and a thrown `FS_NOT_OBSERVED` flow through `ToolRuntime.execute()` and become `isError` tool results with their `{ name, code }` attached.
 
@@ -78,13 +83,13 @@ Use the read tool — not shell commands like cat — to inspect text files. Res
 ##### Write guidance
 
 ```markdown
-Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.
+Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes. content_format defaults to text, which uses the JSON-decoded string unchanged: JSON "\n" is a newline, while "\\n" is a literal backslash plus n. Select escaped only to decode one additional layer of \\, \n, \r, or \t.
 ```
 
 ##### Edit guidance
 
 ```markdown
-Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. String formats default to text, which uses JSON-decoded strings unchanged: JSON "\n" is a newline, while "\\n" is a literal backslash plus n. Select escaped only to decode one additional layer. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.
 ```
 
 #### Token effect
@@ -141,7 +146,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Write returns the exact five-line envelope `<path><displayPath></path>`, `<type>file</type>`, `<content>`, `Created file` or `Updated file`, then `</content>`. Edit returns exactly `The file <displayPath> has been updated successfully.` or, for `replace_all`, `The file <displayPath> has been updated. All occurrences were successfully replaced.` The full write or replacement text remains in the assistant tool-call arguments.
+Write returns its normal envelope and appends `<backup path="<path>" bytes="<n>" />` after an overwrite backup. Edit appends `Backup: <path> (<n> bytes).` when applicable and warns when a non-exact strategy succeeded. The full write or replacement text remains in the assistant tool-call arguments.
 
 #### Token effect
 
@@ -155,7 +160,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Failures are normalized as `Error: <message>`. This package's stable validation and read messages are `file_path must be a non-empty string`, `limit must be less than or equal to <max>`, `old_string must be a non-empty string`, `old_string and new_string must differ`, `cannot read "<path>": not found`, `cannot read "<path>": not a regular file`, `offset <offset> is out of range for "<path>" (<total> lines)`, `cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`, `cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`, and the mismatch repair `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`; provider and policy templates are quoted in their package READMEs. Guarded-mutation failures additionally carry their recovery instruction in the message, appended by this package's model-facing error wrapper: `FS_STALE_VERSION` gets `— re-read the file, then retry`, and `FS_NOT_OBSERVED` gets `— read the file, then retry`; the structured code is preserved. After that reread confirms absence, edit reports `FS_NOT_FOUND` instead of repeating a stale remedy, while write uses guarded creation.
+Failures are normalized as `Error: <message>`. Invalid `escaped` input reports the parameter and rejects unknown sequences or a trailing backslash before any filesystem side effect. `FS_EDIT_NOT_FOUND` and `FS_AMBIGUOUS_EDIT` retain their structured codes and include the path, attempted strategies, and up to the configured candidate count with line number, distance, and bounded preview; no eligible candidate is stated explicitly. Guarded-mutation failures retain their recovery instructions and structured codes.
 
 #### Token effect
 

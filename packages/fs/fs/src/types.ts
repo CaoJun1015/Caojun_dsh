@@ -225,7 +225,7 @@ export interface FsWriteOutcome {
 
 /** A literal-replacement edit request. */
 export interface FsEditRequest {
-  /** Literal non-empty text to replace. Must match exactly (after line-ending normalization). */
+  /** Literal non-empty text to replace. Matching follows `matchOptions` after line-ending normalization. */
   oldString: string
   /** Literal replacement text. An empty string deletes the matched text. */
   newString: string

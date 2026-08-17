@@ -31,10 +31,10 @@
 | `streamText(target, signal?)` | 为大文件按解码后的分片流式读取相同文本（跨分片 UTF-8 解码仍由此处负责）；需要字节上限的消费方在消费流时执行该上限。 |
 | `readBytes(target, signal, maxBytes)` | 把完整普通文件按原始字节读出，不做解码或二进制拒绝。`maxBytes` 为必填，在该 seam 上限制完整内容：已知或读取中发现的超限以 `FS_TOO_LARGE` 失败，而不是截断或无界缓冲。 |
 | `listDir(target, signal?)` | 按稳定名称顺序列出直接子项。返回条目名称、条目类型、解析后的子目标和低成本元数据（若可用则包括 `version`/文件 `size`）；绝不读取文件内容。缺失目标抛出 `FS_NOT_FOUND`，非目录抛出 `FS_NOT_DIRECTORY`，权限失败抛出 `FS_PERMISSION_DENIED`，其他后端 I/O 失败抛出 `FS_IO_ERROR`。损坏/消失的子项可以作为无元数据的 `other` 返回；子项权限/I/O 失败会使用相同结构化代码使整个列表失败。 |
-| `writeText(target, content, expected?, signal?)` | 原子创建/替换。`expected` 是可选的：省略 ⇒ 无条件创建或覆盖；提供 `FsWriteIntent`（`createIfAbsent`/`replaceIfVersion`）⇒ 添加防护。`createIfAbsent` 必须以不替换的方式发布，使初始探测后抢先创建的文件得到保留。 |
-| `editText(target, edit, expected?, signal?)` | 字面量编辑。`expected` 是可选的：省略 ⇒ 无条件编辑当前内容；提供 `{ version }` ⇒ 添加防护，并在匹配之前校验。无论哪种情况，目标缺失都报告 `FS_STALE_VERSION`。应用和写入以原子方式完成，使用同一个变更临界区。 |
+| `writeText(target, content, options)` | 原子创建/替换。`options.intent` 可选：省略时无条件创建或覆盖；提供 `FsWriteIntent`（`createIfAbsent`/`replaceIfVersion`）时添加防护。`options.backup` 显式要求或禁用变更前备份；取消信号和沙箱策略也位于同一个 options 对象。 |
+| `editText(target, edit, options)` | 原子文本编辑。`options.version` 可选，并在匹配前校验。`edit.matchOptions` 选择仅精确匹配或安全渐进匹配；未设置 `replaceAll` 时仍必须得到唯一匹配。`options.backup` 与 write 使用相同的 required/disabled 语义。 |
 
-无论是否有版本防护，变更都在后端的每目标锁内运行，因此无条件写入/编辑仍是原子的；「无条件」只移除*版本*前置条件，不移除原子性。
+无论是否有版本防护，变更都在后端的每目标锁内运行，因此无条件写入/编辑仍是原子的；「无条件」只移除*版本*前置条件，不移除原子性。required 备份在发布前创建并以 `FsBackupRef` 返回；提供方无法创建备份时必须拒绝变更。
 
 ## `fs/*` 政策事件
 
@@ -44,11 +44,11 @@
 
 `ctx.fs` 有意接近 fsspec 风格的存储原语，比字节级 `cat`/`open` 高半层，因为它会解码文本并拒绝二进制，使政策层绝不接触原始字节。它负责 UTF-8 解码、二进制拒绝、原子写入和字面量编辑临界区。它**不** 负责行窗口、编号行、渲染 footer 或已观察状态。已观察状态、编辑前读取和版本防护的写入/编辑属于插件（`@deepseek-ai/dsh-fs-observation-policy`）通过提供可选防护而添加的政策，并非提供方行为，因此沙箱化/远程后端不会继承任何面向模型的观察政策。
 
-`editText` 留在该 seam 上，不由政策层通过读取加写入组合，因为版本防护、字面量匹配和原子重写必须处于同一临界区内，才能正确归因错误并实现一方胜出/一方陈旧的并发；远程后端也可以将其实现为原生比较并编辑操作。
+`editText` 留在该 seam 上，不由政策层通过读取加写入组合，因为版本防护、匹配、备份和原子重写必须处于同一临界区内，才能正确归因错误并实现一方胜出/一方陈旧的并发；远程后端也可以将其实现为原生比较并编辑操作。共享纯匹配器先尝试 LF 规范化后的精确文本，再累计执行搜索文本首尾修剪、逐行尾空白移除和全角 ASCII/U+3000 归一化。它只采用第一个产生匹配的策略，绝不会用近似候选自动修改，并通过结构化错误详情返回有界的行或滑动窗口候选。
 
 ## 词汇
 
-`FsTargetKey` / `FsVersion` 是带品牌的不透明 id（见[品牌 id Agent Note](../../../.agents/notes/implemented/architecture/2026-06-20-branded-ids.md)）；消费方不得解析 `targetKey` 或解释 `version`，只有 `displayPath` 用于模型/UI 输出。`FsObservation` 区分 `{ kind: 'present', version }` 与 `{ kind: 'absent' }`，使策略无需执行 I/O 即可分辨未见目标和确认缺失。`FsWriteIntent` 是显式的防护写入意图（`createIfAbsent` 创建缺失目标，并以 `FS_NOT_OBSERVED` 拒绝现有目标；`replaceIfVersion` 只在观察版本上替换，否则为 `FS_STALE_VERSION`）；从 `writeText` 中省略该值就是第三种无条件状态。`FsPathInfo` 是可报告 `symlink` 的不跟随链接元数据形态，区别于目标级 `FsInfo`。失败会抛出 `FsError`（继承 `HarnessError`；见[结构化错误分类 Agent Note](../../../.agents/notes/implemented/architecture/2026-06-11-structured-error-taxonomy.md)），并携带稳定的 `FsErrorCode`（`FS_NOT_FOUND`、`FS_NOT_DIRECTORY`、`FS_NOT_TEXT`、`FS_NOT_REGULAR_FILE`、`FS_TOO_LARGE`、`FS_PERMISSION_DENIED`、`FS_IO_ERROR`、`FS_STALE_VERSION`、`FS_NOT_OBSERVED`、`FS_AMBIGUOUS_EDIT`、`FS_EDIT_NOT_FOUND`、`FS_ABORTED`）；工具注册表公开 `{ name, code }`，并将其附在 `isError` 结果上。完整约定见 `src/types.ts`。
+`FsTargetKey` / `FsVersion` 是带品牌的不透明 id（见[品牌 id Agent Note](../../../.agents/notes/implemented/architecture/2026-06-20-branded-ids.md)）；消费方不得解析 `targetKey` 或解释 `version`，只有 `displayPath` 用于模型/UI 输出。`FsObservation` 区分存在与确认缺失。`FsWriteIntent` 负责受防护创建/替换；`FsWriteOptions` 和 `FsEditOptions` 显式携带版本意图、`FsBackupPolicy`、取消与沙箱策略。`FsBackupRef` 报告私有恢复路径和字节数，同时模型投影不公开 `sourceVersion`。`FsEditMatchStrategy`、`FsEditCandidate` 与 `FsEditErrorDetails` 让降级成功和失败诊断可以跨提供方保持一致。`FsTextFormat` 与 `decodeEscapedText` 定义可选的严格单层解码器：`text` 保留 JSON 解析后的字符串，`escaped` 仅接受 `\\`、`\n`、`\r` 和 `\t`。失败会抛出携带稳定 `FsErrorCode` 的 `FsError`；工具注册表在 `isError` 结果上公开 `{ name, code }`。完整约定见 `src/types.ts`、`src/edit-match.ts` 与 `src/escaped-text.ts`。
 
 ## 模型体验
 
@@ -64,3 +64,4 @@
 - **只有十二个原语**：没有删除、重命名/移动、复制或监视；`listDir` 只支持一层，递归、glob、分页和搜索不在范围内，见[目录列出 Agent Note](../../../.agents/notes/archived/architecture/2026-07-03-filesystem-directory-listing-seam.md)。
 - **没有 I/O deadline**：该 seam 不启动超时；取消只是每个原语上尽力而为的可选 `AbortSignal`（见有意采用的 [fs 能力族立场](../README.md)）。
 - **先解析后操作使远程后端每次工具调用需要两次往返**：折叠或缓存解析由这种后端自行决定。
+- **没有跨进程 compare-and-swap 发布**：提供方会在 required 备份后、发布前重新检查源版本，这能缩小但无法消除外部进程在复查与原子重命名之间替换文件的窗口。

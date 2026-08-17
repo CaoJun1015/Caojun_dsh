@@ -10,10 +10,15 @@
 |---|---:|---|
 | `maxOutputChars` | `16000` | 文件和目录查看结果保留的前缀字符数。 |
 | `description` | 编辑器命令指南 | 面向模型的工具描述。 |
+| `editMatchMode` | `progressive` | 安全累计匹配；设为 `exact` 时只使用 LF 规范化精确匹配。 |
+| `editCandidateLimit` | `3` | 匹配失败时返回的近似候选上限。 |
+| `editCandidateMaxDistance` | `3` | 候选按 Unicode code point 计算的最大编辑距离。 |
+| `editCandidatePreviewChars` | `160` | 每个预览最多包含的 Unicode code point 数。 |
+| `backupBeforeMutation` | `true` | create/replace/insert 修改现有目标前要求提供方创建备份。 |
 
 ## 工具
 
-schema 提供针对绝对路径的 `view`、`create`、`str_replace` 与 `insert`。文件查看使用从 1 开始的行号，并保留内容中的制表符，因此显示的文本仍可作为有效的字面量替换输入；目录查看忽略隐藏、依赖与 Python 缓存条目并下探两层。`view`、`str_replace` 或 `insert` 发生元数据未命中时，工具会在返回 `FS_NOT_FOUND` 前记录确认缺失，因此后续 `create` 可以通过已挂载策略的防护创建流程恢复外部删除的路径；缺失状态绝不会授权 `str_replace` 或 `insert`。替换要求字面量唯一匹配，错误只使用公开的 `old_str` 词汇。插入遵循所选的零基插入边界，不会隐式补尾换行。修改操作会保留请求编辑范围之外的制表符。
+schema 提供针对绝对路径的 `view`、`create`、`str_replace` 与 `insert`。`file_text_format`、`old_str_format` 与 `new_str_format` 默认为 `text`，保留 JSON 解析后的字符串；`escaped` 严格额外解码一层 `\\`、`\n`、`\r` 和 `\t`。文件查看使用从 1 开始的行号并保留制表符。替换委托给 `ctx.fs.editText`，与 `edit` 使用相同的唯一渐进策略和候选诊断，错误只使用公开的 `old_str` 词汇。create、replace 与 insert 默认要求提供方为现有文件创建备份，成功结果公开恢复路径和字节数。插入遵循所选的零基边界，不会隐式补尾换行。
 
 ## 模型体验
 
@@ -35,7 +40,7 @@ schema 提供针对绝对路径的 `view`、`create`、`str_replace` 与 `insert
 
 #### 模型看到的内容
 
-查看操作返回带行号文本或浅层目录列表。调用会提供文件位置，创建/替换调用还会向展示层提供 diff 卡片。修改操作返回简洁确认。长查看结果保留前缀并追加截断提示。
+查看操作返回带行号文本或浅层目录列表。调用会提供文件位置，创建/替换调用还会向展示层提供 diff 卡片。修改现有文件时，确认结果包含备份恢复路径；降级匹配会说明所用策略。长查看结果保留前缀并追加截断提示。
 
 #### Token 影响
 

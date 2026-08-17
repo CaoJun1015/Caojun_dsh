@@ -540,10 +540,11 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
 * 如果 `path` 是文件，`view` 会显示应用 `cat -n` 后的结果。如果 `path` 是目录，`view` 会列出最多向下 2 层的非隐藏文件和目录
 * 如果指定的 `create` 命令目标 `path` 已作为文件存在，则不能使用该命令
 * 如果 `command` 产生较长输出，输出会被截断并标记为 `<response clipped>`
+* 文本 format 参数默认为 `text`，直接使用 JSON 解析后的字符串。JSON `"\n"` 是换行，`"\\n"` 是字面反斜杠加 n；只有要额外严格解码一层时才选择 `escaped`
 
 使用 `str_replace` 命令时请注意：
 
-* `old_str` 参数应与原文件中一行或多行连续内容**完全**匹配。请留意空白字符！
+* `old_str` 参数必须定位唯一文本区域。渐进匹配可以忽略搜索文本首尾空白、逐行尾空白和全角 ASCII 差异；近似候选只用于提示
 * 如果 `old_str` 参数在文件中不唯一，则不会执行替换。请确保在 `old_str` 中包含足够的上下文，使其唯一
 * `new_str` 参数应包含用于替换 `old_str` 的已编辑行
 
@@ -569,6 +570,14 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
       "type": "string",
       "description": "Required parameter of `create` command, with the content of the file to be created."
     },
+    "file_text_format": {
+      "type": "string",
+      "description": "file_text transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
     "insert_line": {
       "type": "integer",
       "description": "Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`."
@@ -577,9 +586,25 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
       "type": "string",
       "description": "Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert."
     },
+    "new_str_format": {
+      "type": "string",
+      "description": "new_str transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
     "old_str": {
       "type": "string",
       "description": "Required parameter of `str_replace` command containing the string in `path` to replace."
+    },
+    "old_str_format": {
+      "type": "string",
+      "description": "old_str transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     },
     "view_range": {
       "type": "array",
@@ -618,11 +643,27 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
     },
     "old_string": {
       "type": "string",
-      "description": "Literal text to replace. Must match exactly."
+      "description": "Literal text to replace. It must identify a unique match after the configured safe matching strategies."
     },
     "new_string": {
       "type": "string",
       "description": "Literal replacement text. Use an empty string to delete the match."
+    },
+    "old_string_format": {
+      "type": "string",
+      "description": "old_string transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
+    },
+    "new_string_format": {
+      "type": "string",
+      "description": "new_string transport. Defaults to text; escaped decodes exactly one strict escape layer.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     },
     "replace_all": {
       "type": "boolean",
@@ -704,6 +745,14 @@ pwsh 工具是 Windows 组合中 bash 执行器 seam 的 PowerShell 方言消费
     "content": {
       "type": "string",
       "description": "Full UTF-8 text content to write."
+    },
+    "content_format": {
+      "type": "string",
+      "description": "Text transport. Defaults to text (use the JSON-decoded string unchanged); escaped decodes exactly one layer of \\\\, \\n, \\r, and \\t.",
+      "enum": [
+        "text",
+        "escaped"
+      ]
     }
   },
   "required": [

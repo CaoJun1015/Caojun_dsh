@@ -26,6 +26,11 @@ await ctx.plugin(ToolFs)                                  // this package — re
 | `readMaxLineLength` | `2000` | 每行截断前保留的字符数（后缀会说明上限）。 |
 | `readMaxBytes` | `51200` | 一次 `read` 调用所选行的字节上限；溢出时以「已达上限」footer 结束窗口。 |
 | `readStreamMinSize` | `10485760` | 大于等于该大小或大小未知的文件采用流式读取，而不是整体加载到内存。 |
+| `editMatchMode` | `progressive` | 安全累计匹配；设为 `exact` 时只使用 LF 规范化精确匹配。 |
+| `editCandidateLimit` | `3` | 编辑未命中时返回的近似候选上限。 |
+| `editCandidateMaxDistance` | `3` | 候选按 Unicode code point 计算的最大编辑距离。 |
+| `editCandidatePreviewChars` | `160` | 每个候选预览最多显示的 Unicode code point 数。 |
+| `backupBeforeMutation` | `true` | 修改现有文件前要求提供方创建备份。 |
 
 ## 工具（schema 见[文件系统工具 schema Agent Note](../../../.agents/notes/implemented/feature/2026-06-17-filesystem-tool-schemas.md)）
 
@@ -33,12 +38,12 @@ await ctx.plugin(ToolFs)                                  // this package — re
 |---|---|---|
 | `read` | `file_path`、`offset?`、`limit?` | 带行号的 UTF-8 内容和分页 footer。`offset` 从 1 开始；`limit` 默认为配置的 `readLimit`（2000），上限也为该值。 |
 | `read_image` | `file_path` | 通过有界字节 seam 读取 PNG/JPEG/WebP/GIF 文件，经 `ctx.attachments.saveImage` 持久保存，并在小型元数据信封旁返回图像块。只有确切路由的模型声明图像输入时才会成功。 |
-| `write` | `file_path`、`content` | 创建文件或完整替换文件。有策略插件时：覆盖现有文件要求先在未变版本上执行 `read`；创建新文件不需要。没有插件时：无条件执行。 |
-| `edit` | `file_path`、非空 `old_string`、`new_string`、`replace_all?` | 字面量替换；除非 `replace_all` 为 true，否则要求唯一匹配。有策略插件时：要求先执行 `read`（任何窗口），且文件此后未变。没有插件时：无条件执行。 |
+| `write` | `file_path`、`content`、`content_format?` | 创建或完整替换文件。format 默认为 `text`；`escaped` 严格额外解码一层转义。现有文件默认先备份。 |
+| `edit` | `file_path`、非空 `old_string`、`new_string`、`old_string_format?`、`new_string_format?`、`replace_all?` | 默认执行唯一安全渐进匹配。format 默认为 `text`，`escaped` 必须显式选择。发布前备份现有文件。 |
 
 字段名使用 snake_case，与 Claude Code 和现有 harness 工具 schema 一致。
 
-规范成功值分别为：`read` → `{ path, offset, lines: [{ number, text }], totalLines }`，`read_image` → `{ path, image: { attachmentId, mediaType, bytes, width, height, name? } }`，`write` → `{ path, operation: 'create' | 'update', before: string | null, after }`，`edit` → `{ path, before, after }`。原生渲染器会保留下方带行号的读取结果和变更确认。`write`/`edit` 从这些规范值派生可回放的 diff 卡片元数据，`read` 派生可回放的读取卡片窗口 `{ path, offset, lines, totalLines, lang? }`；规范值本身仅限于本次执行，不会添加到 `tool/result`，只有派生出的呈现元数据会被持久化。
+规范成功值分别为：`read` → `{ path, offset, lines, totalLines }`，`read_image` → `{ path, image }`，`write` → `{ path, operation, before, after, backup }`，`edit` → `{ path, before, after, match_strategy, backup }`。创建或禁用备份时 `backup` 为 `null`；可恢复时为 `{ path, bytes }`，提供方版本 token 保持内部状态。原生渲染器保留下方读取和变更确认；只有派生出的展示元数据会持久化到 `tool/result`。
 
 ## 工具就是执行器；策略是事件门禁
 
@@ -46,8 +51,8 @@ await ctx.plugin(ToolFs)                                  // this package — re
 
 - **read**：一次 `ctx.fs.stat`（用于类型、大小路由和版本），随后调用 `readText`/`streamText`，构建行窗口，再发出 `fs/observed`，使用普通 `ctx.emit`。（1 次 stat。）
 - **read_image**：在任何 I/O 之前校验参数、扩展名、附件可用性、部署接受的媒体类型和图像路由；随后一次 `ctx.fs.stat`（目标缺失时与 `read` 一样记录 `absent` 观察）、以 `imageLimits.maxImageBytes` 与 `imageLimits.maxMessageImageBytes` 中较小者为上限的有界 `ctx.fs.readBytes`（结果是携带一张图像的一条消息）、`attachments.saveImage`（内容寻址，因此在 `tool/result` 事件追加时图像块引用的对象已持久提交），最后发出 `fs/observed`。（1 次 stat。）
-- **write**：调用 `ctx.waterfall('fs/write-intent', target, exec, () => undefined)` 取得可选防护，然后调用 `ctx.fs.writeText(target, content, intent)`，再发出 `fs/observed`。（0 次 stat。）
-- **edit**：调用 `ctx.waterfall('fs/edit-intent', target, exec, () => undefined)` 取得可选防护，然后调用 `ctx.fs.editText(target, edit, intent)`，再发出 `fs/observed`。（0 次 stat。）
+- **write**：严格解析所选文本 format，取得可选 intent，再调用 `ctx.fs.writeText(target, content, { intent?, backup, signal, sandboxPolicy? })` 并发出 `fs/observed`。非法转义在路径解析或备份前失败。（0 次 stat。）
+- **edit**：严格解析两个文本 format，取得可选版本，再调用 `ctx.fs.editText(target, edit, { version?, backup, signal, sandboxPolicy? })` 并发出 `fs/observed`。匹配与诊断由提供方共享实现负责。（0 次 stat。）
 
 工具在每次分派中把 `exec`（工具执行上下文）作为不透明 `actor` 传入。默认 thunk 返回 `undefined`（不受约束的裸提供方）。加载 `@deepseek-ai/dsh-fs-observation-policy` 后，它会占用单个决策槽：返回 `createIfAbsent`/`replaceIfVersion`/`{ version }` 或抛出 `FS_NOT_OBSERVED`，并在 `fs/observed` 时记录。后端错误（`FsError`）和抛出的 `FS_NOT_OBSERVED` 会流经 `ToolRuntime.execute()`，变成 `isError` 工具结果，并附带 `{ name, code }`。
 
@@ -78,13 +83,13 @@ Use the read tool — not shell commands like cat — to inspect text files. Res
 ##### Write 指导
 
 ```markdown
-Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.
+Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes. content_format defaults to text, which uses the JSON-decoded string unchanged: JSON "\n" is a newline, while "\\n" is a literal backslash plus n. Select escaped only to decode one additional layer of \\, \n, \r, or \t.
 ```
 
 ##### Edit 指导
 
 ```markdown
-Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.
+Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. String formats default to text, which uses JSON-decoded strings unchanged: JSON "\n" is a newline, while "\\n" is a literal backslash plus n. Select escaped only to decode one additional layer. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.
 ```
 
 #### Token 影响
@@ -141,7 +146,7 @@ Use the edit tool for targeted changes to existing UTF-8 text files. It replaces
 
 #### 模型看到的内容
 
-写入精确返回五行包络：`<path><displayPath></path>`、`<type>file</type>`、`<content>`、`Created file` 或 `Updated file`，以及 `</content>`。编辑精确返回 `The file <displayPath> has been updated successfully.`；对于 `replace_all`，精确返回 `The file <displayPath> has been updated. All occurrences were successfully replaced.`。完整写入或替换文本仍保留在 assistant 工具调用参数中。
+写入返回正常包络；覆写产生备份时在其后追加 `<backup path="<path>" bytes="<n>" />`。编辑在适用时追加 `Backup: <path> (<n> bytes).`，非精确策略成功时还会警告所用策略。完整写入或替换文本仍保留在 assistant 工具调用参数中。
 
 #### Token 影响
 
@@ -155,7 +160,7 @@ Use the edit tool for targeted changes to existing UTF-8 text files. It replaces
 
 #### 模型看到的内容
 
-失败会规范化为 `Error: <message>`。本包稳定的校验和读取消息是 `file_path must be a non-empty string`、`limit must be less than or equal to <max>`、`old_string must be a non-empty string`、`old_string and new_string must differ`、`cannot read "<path>": not found`、`cannot read "<path>": not a regular file`、`offset <offset> is out of range for "<path>" (<total> lines)`、`cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`、`cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`，以及类型不匹配的修复消息 `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`；提供方和策略模板在各自包的 README 中逐字列出。防护变更失败还会在消息中携带恢复指令，由本包面向模型的错误包装追加：`FS_STALE_VERSION` 追加 `— re-read the file, then retry`，`FS_NOT_OBSERVED` 追加 `— read the file, then retry`；结构化错误码保持不变。该次重新读取确认缺失后，edit 会报告 `FS_NOT_FOUND`，而不会重复陈旧恢复指令；write 则使用带防护的创建。
+失败会规范化为 `Error: <message>`。非法 `escaped` 输入会指明参数，并在任何文件系统副作用前拒绝未知序列或末尾孤立反斜杠。`FS_EDIT_NOT_FOUND` 与 `FS_AMBIGUOUS_EDIT` 保留结构化错误码，并包含路径、已尝试策略，以及不超过配置数量的行号、距离和有界预览候选；没有合格候选时会明确说明。带防护变更失败保留恢复指令和结构化错误码。
 
 #### Token 影响
 

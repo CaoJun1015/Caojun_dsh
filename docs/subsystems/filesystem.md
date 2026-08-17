@@ -113,7 +113,7 @@ interface FsDirEntry {
 
 ## Write and edit guards (provider contract)
 
-Both `writeText` and `editText` take their version guard OPTIONALLY: omit it for an unconditional (bare-provider) mutation, supply it to guard. `writeText`'s guard is an `FsWriteIntent` — `createIfAbsent` creates a missing target and rejects an existing one with `FS_NOT_OBSERVED`, including a target that appears after the provider's initial probe because publication itself must be no-replace; `replaceIfVersion` replaces only when the target exists at the observed version, else `FS_STALE_VERSION`. Omitting `expected` unconditionally creates-or-overwrites. The union itself carries only the two guarded intents; "no guard" is expressed by omission, so write and edit both use the same optional `expected` field.
+Both `writeText` and `editText` require an explicit options object. The version fields inside it remain optional: omit `intent`/`version` for an unconditional bare-provider mutation, or supply the policy-produced guard. Every caller explicitly selects `backup: 'required' | 'disabled'`; cancellation and sandbox policy travel in the same object. `createIfAbsent` publishes without replacement, while `replaceIfVersion` and edit reject a changed target with `FS_STALE_VERSION`.
 
 ```ts type-equiv
 /**
@@ -126,6 +126,53 @@ type FsWriteIntent =
   | { kind: 'createIfAbsent' }
   | { kind: 'replaceIfVersion'; version: FsVersion }
 ```
+
+```ts type-equiv
+/** Whether a provider must preserve an existing target before mutation. */
+type FsBackupPolicy = 'required' | 'disabled'
+```
+
+```ts type-equiv
+/** Recoverable provider-owned copy of the bytes that preceded a mutation. */
+interface FsBackupRef {
+  /** Backend path from which the original bytes can be restored. */
+  path: string
+  /** Exact number of bytes copied into the backup. */
+  bytes: number
+  /** Opaque version of the target whose bytes were copied. */
+  sourceVersion: FsVersion
+}
+```
+
+```ts type-equiv
+/** Explicit options for a full-file mutation. */
+interface FsWriteOptions {
+  /** Optional guarded-create or guarded-replace intent. */
+  intent?: FsWriteIntent
+  /** Whether an existing target must be backed up before publication. */
+  backup: FsBackupPolicy
+  /** Abort before atomic publication takes effect. */
+  signal?: AbortSignal
+  /** Per-call sandbox policy interpreted by a confining provider. */
+  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
+}
+```
+
+```ts type-equiv
+/** Explicit options for a literal-edit mutation. */
+interface FsEditOptions {
+  /** Optional version that must still identify the target. */
+  version?: FsVersion
+  /** Whether the matched existing target must be backed up before publication. */
+  backup: FsBackupPolicy
+  /** Abort before atomic publication takes effect. */
+  signal?: AbortSignal
+  /** Per-call sandbox policy interpreted by a confining provider. */
+  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
+}
+```
+
+For an existing file with a required backup, a provider validates the version, creates a durable byte-for-byte backup inside the target lock, rechecks the source version, and then publishes atomically. Backup failure leaves the target unchanged. A new file or failed match produces no backup. Providers prune old versions only after successful publication; prune failure warns without changing a committed outcome. The source recheck narrows external races but is not a cross-process compare-and-swap primitive.
 
 ```ts type-equiv
 /** Outcome of a full-file write. */
@@ -145,20 +192,73 @@ interface FsWriteOutcome {
   before: string | null
   /** The file's content AFTER the write, LF-normalized to share `before`'s diff basis. */
   after: string
+  /** Recoverable pre-mutation bytes, or null for a create or disabled backup. */
+  backup: FsBackupRef | null
 }
 ```
 
-`editText` is a provider-level mutation, not a `read` plus `write` composed elsewhere. When guarded it verifies the expected version BEFORE literal matching (so a stale edit reports `FS_STALE_VERSION`, not a match failure against newer content); unguarded it edits the current content. Either way it applies the replacement and writes atomically — keeping matching, line-ending handling, the stale check, and atomic replacement inside one mutation critical section — and a missing target reports `FS_STALE_VERSION` on both paths.
+`editText` is a provider-level mutation, not a `read` plus `write` composed elsewhere. It keeps version validation, matching, backup, line-ending restoration, and atomic publication in one target lock. Progressive mode tries cumulative strategies in this fixed order: LF-normalized exact, trimmed search text, per-line trailing-whitespace normalization, then full-width ASCII/U+3000 normalization. Only the first strategy with matches is considered. A non-`replaceAll` edit must remain unique; approximate candidates never authorize a mutation.
+
+```ts type-equiv
+/** Matching policy for a literal edit request. */
+interface FsEditMatchOptions {
+  /** Whether matching stops at LF-normalized exact text or uses safe fallbacks. */
+  mode: 'exact' | 'progressive'
+  /** Maximum approximate candidates returned after every automatic strategy fails. */
+  candidateLimit: number
+  /** Maximum Unicode-code-point edit distance for an approximate candidate. */
+  candidateMaxDistance: number
+  /** Maximum Unicode code points retained in each candidate preview. */
+  candidatePreviewChars: number
+}
+```
+
+```ts type-equiv
+/** The successful level in the cumulative literal-edit matching sequence. */
+type FsEditMatchStrategy =
+  | 'exact'
+  | 'trimmed'
+  | 'lineTrailingWhitespace'
+  | 'fullWidthAscii'
+```
+
+```ts type-equiv
+/** One non-authoritative nearby line or multiline window for a failed edit. */
+interface FsEditCandidate {
+  /** One-based first line of the candidate window. */
+  line: number
+  /** Unicode-code-point Levenshtein distance from the normalized search text. */
+  distance: number
+  /** Bounded source-text preview of the candidate window. */
+  preview: string
+}
+```
+
+```ts type-equiv
+/** Structured diagnostics attached to literal-edit matching failures. */
+interface FsEditErrorDetails {
+  /** Backend display path of the file that was searched. */
+  path: string
+  /** Cumulative automatic strategies attempted before the failure. */
+  attemptedStrategies: readonly FsEditMatchStrategy[]
+  /** Nearby candidates, ordered by distance and then line number. */
+  candidates: readonly FsEditCandidate[]
+  /** Number of authoritative matches when the edit was ambiguous. */
+  matchCount?: number
+}
+```
 
 ```ts type-equiv
 /** A literal-replacement edit request. */
 interface FsEditRequest {
-  /** Literal non-empty text to replace. Must match exactly (after line-ending normalization). */
+  /** Literal non-empty text to replace. Matching follows `matchOptions` after line-ending normalization. */
   oldString: string
   /** Literal replacement text. An empty string deletes the matched text. */
   newString: string
   /** Replace every match instead of requiring exactly one. */
   replaceAll: boolean
+  /** Literal matching and failure-diagnostic policy. Omission means exact matching. */
+  matchOptions?: FsEditMatchOptions
 }
 ```
 
@@ -175,8 +275,18 @@ interface FsEditOutcome {
   before: string
   /** The file's content AFTER the edit. */
   after: string
+  /** The first cumulative strategy that produced the authoritative match set. */
+  matchStrategy: FsEditMatchStrategy
+  /** Recoverable pre-mutation bytes, or null when backup was disabled. */
+  backup: FsBackupRef | null
 }
 ```
+
+Failed matching compares a single-line search against each line, or a multiline search against equal-height sliding windows. Banded Levenshtein counts Unicode code points and exits beyond the configured threshold. `FsEditErrorDetails` carries the path, attempted strategies, and bounded `{ line, distance, preview }` candidates for `FS_EDIT_NOT_FOUND` or `FS_AMBIGUOUS_EDIT`.
+
+## Explicit text formats (consumer input)
+
+Tool strings default to `text`: the JSON parser's result is used unchanged, so JSON `"\n"` is a newline and `"\\n"` is a literal backslash plus `n`. A caller may explicitly select `escaped` to decode one additional layer. The strict left-to-right decoder accepts only `\\`, `\n`, `\r`, and `\t`; an unknown sequence or trailing backslash is an argument error before path resolution, backup, or mutation. There is no content heuristic or automatic repair.
 
 ## The fs policy events (provider contract vocabulary)
 
@@ -396,18 +506,17 @@ abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: 
 abstract listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]>
 
 /**
- * Atomically create or replace UTF-8 text. `expected` guards intent and
- * staleness; omission allows unconditional overwrite.
+ * Atomically create or replace UTF-8 text. `options.intent` guards intent and
+ * staleness; omission of the intent allows unconditional overwrite.
  * @param target - the resolved target to write.
  * @param content - the full new file content.
- * @param expected - the write intent guarding the write; omit for unconditional.
- * @param signal - aborts before atomic publication takes effect.
- * @param sandboxPolicy - the per-call mode and workspace root this write
+ * @param options - write intent, backup policy, cancellation, and the per-call
+ *   mode and workspace root this write
  *   runs under; a sandboxing backend fences the write by it, the bare backend
  *   ignores it. Omit to leave the backend its own default.
  * @returns the outcome, including the version the write produced.
  */
-abstract writeText( target: FsTarget, content: string, expected?: FsWriteIntent, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsWriteOutcome>
+abstract writeText( target: FsTarget, content: string, options: FsWriteOptions, ): Promise<FsWriteOutcome>
 
 /**
  * Atomically edit literal text. When supplied, the version guard is checked
@@ -415,19 +524,16 @@ abstract writeText( target: FsTarget, content: string, expected?: FsWriteIntent,
  * the current content without a freshness precondition.
  * @param target - the resolved target to edit.
  * @param edit - the literal search/replace request.
- * @param expected - the version guard; omit for an unconditional edit.
- * @param signal - aborts before atomic publication takes effect.
- * @param sandboxPolicy - the per-call mode and workspace root this edit runs
+ * @param options - version guard, backup policy, cancellation, and the per-call
+ *   mode and workspace root this edit runs
  *   under; a sandboxing backend fences the edit by it, the bare backend
  *   ignores it. Omit to leave the backend its own default.
  * @returns the outcome, including the version the edit produced.
  */
-abstract editText( target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsEditOutcome>
+abstract editText( target: FsTarget, edit: FsEditRequest, options: FsEditOptions, ): Promise<FsEditOutcome>
 ```
 
-Types: [SandboxExecutionPolicy](sandbox.md)
-
-Source: [`packages/fs/fs/src/index.ts:86`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts:109`](../../packages/fs/fs/src/index.ts)
 
 <a id="fs-events"></a>
 
@@ -450,7 +556,7 @@ Single-slot decision for the next FileSystem.editText. Calling `next()` yields a
 'fs/edit-intent'(target: FsTarget, actor: object | undefined, next: () => { version: FsVersion } | undefined | Promise<{ version: FsVersion } | undefined>): Promise<{ version: FsVersion } | undefined>
 ```
 
-Source: [`packages/fs/fs/src/index.ts:66`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts:89`](../../packages/fs/fs/src/index.ts)
 
 <a id="fsobserved--emit"></a>
 
@@ -471,7 +577,7 @@ Record an authoritative positive or negative observation. Listeners must be sync
 'fs/observed'(target: FsTarget, observation: FsObservation, actor: object | undefined): void
 ```
 
-Source: [`packages/fs/fs/src/index.ts:76`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts:99`](../../packages/fs/fs/src/index.ts)
 
 <a id="fswrite-intent--waterfall"></a>
 
@@ -491,5 +597,5 @@ Single-slot decision for the next FileSystem.writeText. Calling `next()` yields 
 'fs/write-intent'(target: FsTarget, actor: object | undefined, next: () => FsWriteIntent | undefined | Promise<FsWriteIntent | undefined>): Promise<FsWriteIntent | undefined>
 ```
 
-Source: [`packages/fs/fs/src/index.ts:58`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts:81`](../../packages/fs/fs/src/index.ts)
 <!-- END GENERATED cordis-surface -->
