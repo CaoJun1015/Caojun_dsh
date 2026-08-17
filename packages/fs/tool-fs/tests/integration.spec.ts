@@ -54,7 +54,7 @@ describe('default deployment (with dsh-fs-observation-policy)', () => {
     ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    await ctx.plugin(LocalFileSystem, { cwd: dir })
+    await ctx.plugin(LocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') })
     await ctx.plugin(FsPolicy)
     fiber = await ctx.plugin(ToolFs)
   })
@@ -83,6 +83,10 @@ describe('default deployment (with dsh-fs-observation-policy)', () => {
       const result = await call('write', { file_path: 'a.txt', content: 'replaced' })
       expect(result.isError).toBe(false)
       expect(await readFile(join(dir, 'a.txt'), 'utf8')).toBe('replaced')
+      expect(result.value).toMatchObject({ backup: { bytes: 8 } })
+      const backup = (result.value as { backup: { path: string } }).backup
+      expect(await readFile(backup.path, 'utf8')).toBe('original')
+      expect(text(result)).toContain(`<backup path="${backup.path}" bytes="8" />`)
     })
 
     it('rejects a full overwrite when the file changed since the read (stale)', async () => {
@@ -316,7 +320,7 @@ describe('bare provider (no dsh-fs-observation-policy)', () => {
     ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    await ctx.plugin(LocalFileSystem, { cwd: dir })
+    await ctx.plugin(LocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') })
     fiber = await ctx.plugin(ToolFs)
   })
 
@@ -384,7 +388,7 @@ describe('per-session cwd', () => {
     ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    await ctx.plugin(LocalFileSystem, { cwd: dir }) // config.cwd = dir, NOT sessionDir
+    await ctx.plugin(LocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') }) // config.cwd = dir, NOT sessionDir
     await ctx.plugin(FsPolicy)
     fiber = await ctx.plugin(ToolFs)
   })
@@ -429,7 +433,7 @@ describe('signal, concurrency, and the fs/observed contract', () => {
     ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    await ctx.plugin(LocalFileSystem, { cwd: dir })
+    await ctx.plugin(LocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') })
     await ctx.plugin(FsPolicy)
     fiber = await ctx.plugin(ToolFs)
   })

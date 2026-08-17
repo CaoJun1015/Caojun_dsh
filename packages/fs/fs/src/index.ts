@@ -9,10 +9,11 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
+import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {
   FsDirEntry,
   FsEditOutcome,
+  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
@@ -20,6 +21,7 @@ import type {
   FsTarget,
   FsVersion,
   FsWriteIntent,
+  FsWriteOptions,
   FsWriteOutcome,
 } from './types.ts'
 
@@ -36,10 +38,13 @@ export {
 } from './types.ts'
 export type {
   FsEditCandidate,
+  FsBackupPolicy,
+  FsBackupRef,
   FsEditErrorDetails,
   FsEditMatchOptions,
   FsEditMatchStrategy,
   FsEditOutcome,
+  FsEditOptions,
   FsEditRequest,
   FsDirEntry,
   FsErrorCode,
@@ -48,6 +53,7 @@ export type {
   FsPathInfo,
   FsTarget,
   FsWriteIntent,
+  FsWriteOptions,
   FsWriteOutcome,
 } from './types.ts'
 
@@ -218,13 +224,12 @@ export abstract class FileSystem extends Service {
   abstract listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]>
 
   /**
-   * Atomically create or replace UTF-8 text. `expected` guards intent and
-   * staleness; omission allows unconditional overwrite.
+   * Atomically create or replace UTF-8 text. `options.intent` guards intent and
+   * staleness; omission of the intent allows unconditional overwrite.
    * @param target - the resolved target to write.
    * @param content - the full new file content.
-   * @param expected - the write intent guarding the write; omit for unconditional.
-   * @param signal - aborts before atomic publication takes effect.
-   * @param sandboxPolicy - the per-call mode and workspace root this write
+   * @param options - write intent, backup policy, cancellation, and the per-call
+   *   mode and workspace root this write
    *   runs under; a sandboxing backend fences the write by it, the bare backend
    *   ignores it. Omit to leave the backend its own default.
    * @returns the outcome, including the version the write produced.
@@ -232,9 +237,7 @@ export abstract class FileSystem extends Service {
   abstract writeText(
     target: FsTarget,
     content: string,
-    expected?: FsWriteIntent,
-    signal?: AbortSignal,
-    sandboxPolicy?: SandboxExecutionPolicy,
+    options: FsWriteOptions,
   ): Promise<FsWriteOutcome>
 
   /**
@@ -243,9 +246,8 @@ export abstract class FileSystem extends Service {
    * the current content without a freshness precondition.
    * @param target - the resolved target to edit.
    * @param edit - the literal search/replace request.
-   * @param expected - the version guard; omit for an unconditional edit.
-   * @param signal - aborts before atomic publication takes effect.
-   * @param sandboxPolicy - the per-call mode and workspace root this edit runs
+   * @param options - version guard, backup policy, cancellation, and the per-call
+   *   mode and workspace root this edit runs
    *   under; a sandboxing backend fences the edit by it, the bare backend
    *   ignores it. Omit to leave the backend its own default.
    * @returns the outcome, including the version the edit produced.
@@ -253,9 +255,7 @@ export abstract class FileSystem extends Service {
   abstract editText(
     target: FsTarget,
     edit: FsEditRequest,
-    expected?: { version: FsVersion },
-    signal?: AbortSignal,
-    sandboxPolicy?: SandboxExecutionPolicy,
+    options: FsEditOptions,
   ): Promise<FsEditOutcome>
 }
 

@@ -34,7 +34,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import type { Config as LocalConfig } from '@deepseek-ai/dsh-fs-local'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsEditOptions, FsEditOutcome, FsEditRequest, FsTarget, FsWriteOptions, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -75,20 +75,19 @@ export class SandboxedFileSystem extends LocalFileSystem {
    * atomic write. See {@link checkedTarget}.
    * @param target - the resolved target to write.
    * @param content - the full new file content.
-   * @param expected - the write intent guarding the write; omit for unconditional.
-   * @param signal - aborts before atomic publication takes effect.
-   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
-   *   the deployment fallback.
+   * @param options - intent, backup policy, cancellation, and per-call sandbox policy.
    * @returns the write outcome from the inherited backend.
    */
   override async writeText(
     target: FsTarget,
     content: string,
-    expected?: FsWriteIntent,
-    signal?: AbortSignal,
-    sandboxPolicy?: SandboxExecutionPolicy,
+    options: FsWriteOptions,
   ): Promise<FsWriteOutcome> {
-    return super.writeText(await this.checkedTarget(target, sandboxPolicy), content, expected, signal)
+    return super.writeText(
+      await this.checkedTarget(target, options.sandboxPolicy),
+      content,
+      options,
+    )
   }
 
   /**
@@ -96,20 +95,19 @@ export class SandboxedFileSystem extends LocalFileSystem {
    * atomic edit. See {@link checkedTarget}.
    * @param target - the resolved target to edit.
    * @param edit - the literal search/replace request.
-   * @param expected - the version guard; omit for an unconditional edit.
-   * @param signal - aborts before atomic publication takes effect.
-   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
-   *   the deployment fallback.
+   * @param options - version guard, backup policy, cancellation, and per-call sandbox policy.
    * @returns the edit outcome from the inherited backend.
    */
   override async editText(
     target: FsTarget,
     edit: FsEditRequest,
-    expected?: { version: FsVersion },
-    signal?: AbortSignal,
-    sandboxPolicy?: SandboxExecutionPolicy,
+    options: FsEditOptions,
   ): Promise<FsEditOutcome> {
-    return super.editText(await this.checkedTarget(target, sandboxPolicy), edit, expected, signal)
+    return super.editText(
+      await this.checkedTarget(target, options.sandboxPolicy),
+      edit,
+      options,
+    )
   }
 
   /**

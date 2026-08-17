@@ -15,10 +15,12 @@ import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs
 import type {
   FsDirEntry,
   FsEditOutcome,
+  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
   FsTarget,
+  FsWriteOptions,
   FsWriteIntent,
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
@@ -81,20 +83,20 @@ class FakeFs extends FileSystem {
   override async listDir(_target: FsTarget): Promise<FsDirEntry[]> {
     return []
   }
-  override async writeText(target: FsTarget, content: string, expected?: FsWriteIntent): Promise<FsWriteOutcome> {
+  override async writeText(target: FsTarget, content: string, options: FsWriteOptions): Promise<FsWriteOutcome> {
     this.throwIfArmed()
-    this.writeIntents.push(expected)
+    this.writeIntents.push(options.intent)
     const before = this.files.get(target.targetKey) ?? null
     this.files.set(target.targetKey, content)
-    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content }
+    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content, backup: null }
   }
-  override async editText(target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }): Promise<FsEditOutcome> {
+  override async editText(target: FsTarget, edit: FsEditRequest, options: FsEditOptions): Promise<FsEditOutcome> {
     this.throwIfArmed()
-    this.editIntents.push(expected)
+    this.editIntents.push(options.version === undefined ? undefined : { version: options.version })
     const content = this.files.get(target.targetKey) ?? ''
     const after = content.split(edit.oldString).join(edit.newString)
     this.files.set(target.targetKey, after)
-    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact' }
+    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact', backup: null }
   }
 }
 
@@ -397,7 +399,7 @@ describe('write tool', () => {
     const result = await call(ctx, 'write', { file_path: 'a.txt', content: 'hi' }, { session: { header: {} } })
     expect(result.isError).toBe(false)
     if (result.isError) throw new Error('expected write success')
-    expect(result.value).toEqual({ path: '/abs/a.txt', operation: 'create', before: null, after: 'hi' })
+    expect(result.value).toEqual({ path: '/abs/a.txt', operation: 'create', before: null, after: 'hi', backup: null })
     expect(text(result)).toContain('Created file')
     expect(fs.writeIntents).toEqual([{ kind: 'createIfAbsent' }])
   })
@@ -427,7 +429,7 @@ describe('edit tool', () => {
     await call(ctx, 'read', { file_path: 'a.txt' }, { session })
     const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' }, { session })
     if (result.isError) throw new Error('expected edit success')
-    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b', match_strategy: 'exact' })
+    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b', match_strategy: 'exact', backup: null })
     expect(text(result)).toBe('The file /abs/a.txt has been updated successfully.')
   })
 
@@ -769,22 +771,18 @@ describe('sandbox escalation API (write/edit)', () => {
     override async writeText(
       target: FsTarget,
       content: string,
-      expected?: FsWriteIntent,
-      _signal?: AbortSignal,
-      sandboxPolicy?: SandboxExecutionPolicy,
+      options: FsWriteOptions,
     ): Promise<FsWriteOutcome> {
-      this.stamped.push(sandboxPolicy)
-      return super.writeText(target, content, expected)
+      this.stamped.push(options.sandboxPolicy)
+      return super.writeText(target, content, options)
     }
     override async editText(
       target: FsTarget,
       edit: FsEditRequest,
-      expected?: { version: FsVersion },
-      _signal?: AbortSignal,
-      sandboxPolicy?: SandboxExecutionPolicy,
+      options: FsEditOptions,
     ): Promise<FsEditOutcome> {
-      this.stamped.push(sandboxPolicy)
-      return super.editText(target, edit, expected)
+      this.stamped.push(options.sandboxPolicy)
+      return super.editText(target, edit, options)
     }
   }
 

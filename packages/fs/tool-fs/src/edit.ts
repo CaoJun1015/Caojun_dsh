@@ -63,13 +63,19 @@ export function parseEditArgs(args: { file_path: string; old_string: string; new
  * @param replaceAll - selects the all-occurrences wording over the single-replacement one.
  * @returns the confirmation sentence the model sees as the tool result.
  */
-export function formatEditOutput(displayPath: string, replaceAll: boolean, strategy: FsEditMatchStrategy = 'exact'): string {
+export function formatEditOutput(
+  displayPath: string,
+  replaceAll: boolean,
+  strategy: FsEditMatchStrategy = 'exact',
+  backup: { path: string; bytes: number } | null = null,
+): string {
   const confirmation = replaceAll
     ? `The file ${displayPath} has been updated. All occurrences were successfully replaced.`
     : `The file ${displayPath} has been updated successfully.`
+  const recovery = backup === null ? '' : ` Backup: ${backup.path} (${backup.bytes} bytes).`
   return strategy === 'exact'
-    ? confirmation
-    : `${confirmation} Warning: the edit used the ${strategy} fallback matching strategy.`
+    ? `${confirmation}${recovery}`
+    : `${confirmation}${recovery} Warning: the edit used the ${strategy} fallback matching strategy.`
 }
 
 /**
@@ -77,7 +83,12 @@ export function formatEditOutput(displayPath: string, replaceAll: boolean, strat
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
  */
-export function applyEditTool(ctx: Context, sandbox: FsSandboxController, matchOptions: FsEditMatchOptions): void {
+export function applyEditTool(
+  ctx: Context,
+  sandbox: FsSandboxController,
+  matchOptions: FsEditMatchOptions,
+  backupBeforeMutation: boolean,
+): void {
   ctx.systemPrompt.section({
     name: 'tool:edit',
     order: 102,
@@ -103,11 +114,30 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController, matchO
           before: { type: 'string', required: true },
           after: { type: 'string', required: true },
           match_strategy: { type: 'string', required: true },
+          backup: {
+            required: true,
+            oneOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  path: { type: 'string', required: true },
+                  bytes: { type: 'integer', required: true },
+                },
+              },
+            ],
+          },
         },
       },
       render: (args, value) => [{
         type: 'text',
-        text: formatEditOutput(value.path, args.replace_all ?? false, value.match_strategy as FsEditMatchStrategy),
+        text: formatEditOutput(
+          value.path,
+          args.replace_all ?? false,
+          value.match_strategy as FsEditMatchStrategy,
+          value.backup,
+        ),
       }],
       presentationMeta: (args, value) => ({
         diffs: computeHunkDiffs(args.file_path, value.before, value.after)
@@ -137,9 +167,12 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController, matchO
             replaceAll: input.replaceAll,
             matchOptions,
           },
-          intent,
-          exec.signal,
-          sandboxPolicy,
+          {
+            ...intent === undefined ? {} : { version: intent.version },
+            backup: backupBeforeMutation ? 'required' : 'disabled',
+            signal: exec.signal,
+            ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+          },
         )
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
@@ -154,6 +187,9 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController, matchO
         before: outcome.before,
         after: outcome.after,
         match_strategy: outcome.matchStrategy,
+        backup: outcome.backup === null
+          ? null
+          : { path: outcome.backup.path, bytes: outcome.backup.bytes },
       }
     },
     // Pure display: a diff card of the literal replacement (old_string → new_string), derived

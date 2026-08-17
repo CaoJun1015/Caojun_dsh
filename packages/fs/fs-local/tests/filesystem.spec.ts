@@ -8,7 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { constants as bufferConstants } from 'node:buffer'
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -16,17 +16,52 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { FsVersion } from '@deepseek-ai/dsh-fs'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
+import type { FsEditOptions, FsEditRequest, FsWriteIntent, FsWriteOptions } from '@deepseek-ai/dsh-fs'
+
+class TestLocalFileSystem extends LocalFileSystem {
+  override writeText(
+    target: FsTarget,
+    content: string,
+    optionsOrIntent?: FsWriteOptions | FsWriteIntent,
+    signal?: AbortSignal,
+  ) {
+    const options: FsWriteOptions = optionsOrIntent !== undefined && 'backup' in optionsOrIntent
+      ? optionsOrIntent
+      : {
+        ...optionsOrIntent === undefined ? {} : { intent: optionsOrIntent },
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+      }
+    return super.writeText(target, content, options)
+  }
+
+  override editText(
+    target: FsTarget,
+    edit: FsEditRequest,
+    optionsOrVersion?: FsEditOptions | { version: FsVersion },
+    signal?: AbortSignal,
+  ) {
+    const options: FsEditOptions = optionsOrVersion !== undefined && 'backup' in optionsOrVersion
+      ? optionsOrVersion
+      : {
+        ...optionsOrVersion,
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+      }
+    return super.editText(target, edit, options)
+  }
+}
 
 let dir: string
 let ctx: Context
-let fs: LocalFileSystem
+let fs: TestLocalFileSystem
 let fiber: Awaited<ReturnType<Context['plugin']>>
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dsh-fs-'))
   ctx = new Context()
-  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir })
-  fs = ctx.fs as LocalFileSystem
+  fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') })
+  fs = ctx.fs as TestLocalFileSystem
 })
 afterEach(async () => {
   await fiber.dispose()
@@ -46,8 +81,8 @@ async function versionOf(target: FsTarget): Promise<FsVersion> {
 
 async function remountWithDiffLimit(diffBasisMaxBytes: number): Promise<void> {
   await fiber.dispose()
-  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir, diffBasisMaxBytes })
-  fs = ctx.fs as LocalFileSystem
+  fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, diffBasisMaxBytes, backupRoot: join(dir, '.backups') })
+  fs = ctx.fs as TestLocalFileSystem
 }
 
 describe('registration', () => {
@@ -777,5 +812,73 @@ describe('HMR / disposal', () => {
     expect(local.fs).toBeDefined()
     await localFiber.dispose()
     expect(local.fs).toBeUndefined()
+  })
+})
+
+describe('mutation backups', () => {
+  it('preserves the exact original bytes and reports no backup for a create', async () => {
+    const existingPath = join(dir, 'binary.dat')
+    const original = Buffer.from([0, 255, 13, 10, 65])
+    await writeFile(existingPath, original)
+    const existing = await fs.resolve(existingPath)
+    const updated = await fs.writeText(existing, 'text', {
+      intent: { kind: 'replaceIfVersion', version: await versionOf(existing) },
+      backup: 'required',
+    })
+    expect(updated.backup).toMatchObject({ bytes: original.length })
+    if (updated.backup === null) throw new Error('expected update backup')
+    expect(await readFile(updated.backup.path)).toEqual(original)
+    expect(updated.backup.sourceVersion).not.toBe(updated.version)
+
+    const created = await fs.writeText(await fs.resolve('new.txt'), 'new', {
+      intent: { kind: 'createIfAbsent' },
+      backup: 'required',
+    })
+    expect(created.backup).toBeNull()
+  })
+
+  it('does not back up a failed match and blocks publication when backup creation fails', async () => {
+    const path = join(dir, 'story.txt')
+    await writeFile(path, 'original')
+    const target = await fs.resolve(path)
+    await expect(fs.editText(target, {
+      oldString: 'absent', newString: 'x', replaceAll: false,
+    }, { version: await versionOf(target), backup: 'required' })).rejects.toMatchObject({ code: 'FS_EDIT_NOT_FOUND' })
+    await expect(access(join(dir, '.backups'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const blockedRoot = join(dir, 'not-a-directory')
+    await writeFile(blockedRoot, 'occupied')
+    await fiber.dispose()
+    fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, backupRoot: blockedRoot })
+    fs = ctx.fs as TestLocalFileSystem
+    await expect(fs.writeText(target, 'replacement', {
+      intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
+      backup: 'required',
+    })).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
+    expect(await readFile(path, 'utf8')).toBe('original')
+  })
+
+  it('retains the newest three backups and narrows an external-write race', async () => {
+    const path = join(dir, 'versions.txt')
+    await writeFile(path, 'v0')
+    const target = await fs.resolve(path)
+    const backups: string[] = []
+    for (let index = 1; index <= 4; index += 1) {
+      const outcome = await fs.writeText(target, `v${index}`, {
+        intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
+        backup: 'required',
+      })
+      if (outcome.backup === null) throw new Error('expected update backup')
+      backups.push(outcome.backup.path)
+    }
+    await expect(access(backups[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    for (const backup of backups.slice(1)) await expect(access(backup)).resolves.toBeUndefined()
+
+    fs.internals.afterBackup = async () => writeFile(path, 'external')
+    await expect(fs.writeText(target, 'ours', {
+      intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
+      backup: 'required',
+    })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    expect(await readFile(path, 'utf8')).toBe('external')
   })
 })

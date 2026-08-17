@@ -234,6 +234,7 @@ async function createFile(
   policy: MutationPolicy,
   path: string,
   fileText: string | undefined,
+  backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
   const content = requiredForCommand(fileText, 'file_text', 'create')
@@ -253,9 +254,12 @@ async function createFile(
     outcome = await ctx.fs.writeText(
       target,
       content,
-      intent,
-      exec.signal,
-      sandboxPolicy,
+      {
+        ...intent === undefined ? {} : { intent },
+        backup: backupBeforeMutation ? 'required' : 'disabled',
+        signal: exec.signal,
+        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+      },
     )
   } catch (error: unknown) {
     throw policy.mapError(error, sandboxPolicy)
@@ -271,6 +275,7 @@ async function replaceInFile(
   oldStr: string | undefined,
   newStr: string | undefined,
   matchOptions: FsEditMatchOptions,
+  backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
   const sandboxPolicy = policy.resolve(exec)
@@ -283,17 +288,21 @@ async function replaceInFile(
     outcome = await ctx.fs.editText(
       target,
       { oldString: oldValue, newString: newValue, replaceAll: false, matchOptions },
-      intent,
-      exec.signal,
-      sandboxPolicy,
+      {
+        ...intent === undefined ? {} : { version: intent.version },
+        backup: backupBeforeMutation ? 'required' : 'disabled',
+        signal: exec.signal,
+        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+      },
     )
   } catch (error: unknown) {
     throw formatEditFsError(policy.mapError(error, sandboxPolicy))
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
+  const backup = outcome.backup === null ? '' : ` Backup: ${outcome.backup.path} (${outcome.backup.bytes} bytes).`
   return outcome.matchStrategy === 'exact'
-    ? `The file ${target.displayPath} has been edited successfully.`
-    : `The file ${target.displayPath} has been edited successfully. Warning: the edit used the ${outcome.matchStrategy} fallback matching strategy.`
+    ? `The file ${target.displayPath} has been edited successfully.${backup}`
+    : `The file ${target.displayPath} has been edited successfully.${backup} Warning: the edit used the ${outcome.matchStrategy} fallback matching strategy.`
 }
 
 async function insertInFile(
@@ -302,6 +311,7 @@ async function insertInFile(
   path: string,
   insertLine: number | undefined,
   newStr: string | undefined,
+  backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
   if (insertLine === undefined) throw new Error('Parameter `insert_line` is required for command: insert')
@@ -330,18 +340,25 @@ async function insertInFile(
     : { kind: 'replaceIfVersion', version: intent.version }
   let outcome
   try {
-    outcome = await ctx.fs.writeText(target, after, expected, exec.signal, sandboxPolicy)
+    outcome = await ctx.fs.writeText(target, after, {
+      intent: expected,
+      backup: backupBeforeMutation ? 'required' : 'disabled',
+      signal: exec.signal,
+      ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+    })
   } catch (error: unknown) {
     throw policy.mapError(error, sandboxPolicy)
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-  return `The file ${target.displayPath} has been edited successfully.`
+  const backup = outcome.backup === null ? '' : ` Backup: ${outcome.backup.path} (${outcome.backup.bytes} bytes).`
+  return `The file ${target.displayPath} has been edited successfully.${backup}`
 }
 
 interface ResolvedConfig {
   maxOutputChars: number
   description: string
   editMatchOptions: FsEditMatchOptions
+  backupBeforeMutation: boolean
 }
 
 function presentEditorCall(args: {
@@ -440,7 +457,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         case 'view':
           return viewPath(ctx, args.path, args.view_range, config.maxOutputChars, exec)
         case 'create':
-          return createFile(ctx, policy, args.path, args.file_text, exec)
+          return createFile(ctx, policy, args.path, args.file_text, config.backupBeforeMutation, exec)
         case 'str_replace':
           return replaceInFile(
             ctx,
@@ -449,6 +466,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             args.old_str,
             args.new_str,
             config.editMatchOptions,
+            config.backupBeforeMutation,
             exec,
           )
         case 'insert':
@@ -458,6 +476,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             args.path,
             args.insert_line,
             args.new_str,
+            config.backupBeforeMutation,
             exec,
           )
       }
@@ -483,6 +502,8 @@ export interface Config {
   editCandidateMaxDistance?: number
   /** Maximum Unicode code points retained in each candidate preview. */
   editCandidatePreviewChars?: number
+  /** Require provider backup before replacing an existing file. Defaults to true. */
+  backupBeforeMutation?: boolean
 }
 
 /** Runtime configuration schema for the string-replacement editor tool. */
@@ -493,6 +514,7 @@ export const Config: z<Config> = z.object({
   editCandidateLimit: z.number().default(3),
   editCandidateMaxDistance: z.number().default(3),
   editCandidatePreviewChars: z.number().default(160),
+  backupBeforeMutation: z.boolean().default(true),
 })
 
 /** Register one `str_replace_editor` tool over `ctx.fs`. */
@@ -506,6 +528,7 @@ export function apply(ctx: Context, config: Config): void {
       candidateMaxDistance: config.editCandidateMaxDistance ?? 3,
       candidatePreviewChars: config.editCandidatePreviewChars ?? 160,
     },
+    backupBeforeMutation: config.backupBeforeMutation ?? true,
   }
   if (!Number.isSafeInteger(resolved.maxOutputChars) || resolved.maxOutputChars <= 0) {
     throw new Error('tool-str-replace-editor: maxOutputChars must be a positive safe integer')

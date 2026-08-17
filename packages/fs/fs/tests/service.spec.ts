@@ -11,11 +11,12 @@ import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs
 import type {
   FsDirEntry,
   FsEditOutcome,
+  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
   FsTarget,
-  FsWriteIntent,
+  FsWriteOptions,
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 
@@ -69,16 +70,16 @@ class FakeFileSystem extends FileSystem {
       },
     ]
   }
-  override async writeText(target: FsTarget, content: string, _expected?: FsWriteIntent): Promise<FsWriteOutcome> {
+  override async writeText(target: FsTarget, content: string, _options: FsWriteOptions): Promise<FsWriteOutcome> {
     const before = this.files.get(target.targetKey) ?? null
     this.files.set(target.targetKey, content)
-    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content }
+    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content, backup: null }
   }
-  override async editText(target: FsTarget, edit: FsEditRequest): Promise<FsEditOutcome> {
+  override async editText(target: FsTarget, edit: FsEditRequest, _options: FsEditOptions): Promise<FsEditOutcome> {
     const content = this.files.get(target.targetKey) ?? ''
     const after = content.split(edit.oldString).join(edit.newString)
     this.files.set(target.targetKey, after)
-    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact' }
+    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact', backup: null }
   }
 }
 

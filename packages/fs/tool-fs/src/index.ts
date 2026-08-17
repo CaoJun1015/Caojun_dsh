@@ -39,6 +39,8 @@ export interface Config {
   editCandidateMaxDistance?: number
   /** Maximum Unicode code points shown in each nearby-candidate preview. */
   editCandidatePreviewChars?: number
+  /** Require provider backup before replacing an existing file. Defaults to true. */
+  backupBeforeMutation?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -50,6 +52,7 @@ export const Config: z<Config> = z.object({
   editCandidateLimit: z.number().default(3),
   editCandidateMaxDistance: z.number().default(3),
   editCandidatePreviewChars: z.number().default(160),
+  backupBeforeMutation: z.boolean().default(true),
 })
 
 /** The shape after schemastery applied the defaults. */
@@ -93,11 +96,11 @@ export function apply(ctx: Context, config: Config): void {
   // per-call policy resolution, and denial-marker mapping, all keyed off whether
   // the mounted ctx.fs confines (ctx.fs.sandboxMode).
   const sandbox = new FsSandboxController(ctx)
-  applyWriteTool(ctx, sandbox)
+  applyWriteTool(ctx, sandbox, resolved.backupBeforeMutation)
   applyEditTool(ctx, sandbox, {
     mode: resolved.editMatchMode,
     candidateLimit: resolved.editCandidateLimit,
     candidateMaxDistance: resolved.editCandidateMaxDistance,
     candidatePreviewChars: resolved.editCandidatePreviewChars,
-  })
+  }, resolved.backupBeforeMutation)
 }

@@ -124,6 +124,43 @@ export type FsWriteIntent =
   | { kind: 'createIfAbsent' }
   | { kind: 'replaceIfVersion'; version: FsVersion }
 
+/** Whether a provider must preserve an existing target before mutation. */
+export type FsBackupPolicy = 'required' | 'disabled'
+
+/** Recoverable provider-owned copy of the bytes that preceded a mutation. */
+export interface FsBackupRef {
+  /** Backend path from which the original bytes can be restored. */
+  path: string
+  /** Exact number of bytes copied into the backup. */
+  bytes: number
+  /** Opaque version of the target whose bytes were copied. */
+  sourceVersion: FsVersion
+}
+
+/** Explicit options for a full-file mutation. */
+export interface FsWriteOptions {
+  /** Optional guarded-create or guarded-replace intent. */
+  intent?: FsWriteIntent
+  /** Whether an existing target must be backed up before publication. */
+  backup: FsBackupPolicy
+  /** Abort before atomic publication takes effect. */
+  signal?: AbortSignal
+  /** Per-call sandbox policy interpreted by a confining provider. */
+  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
+}
+
+/** Explicit options for a literal-edit mutation. */
+export interface FsEditOptions {
+  /** Optional version that must still identify the target. */
+  version?: FsVersion
+  /** Whether the matched existing target must be backed up before publication. */
+  backup: FsBackupPolicy
+  /** Abort before atomic publication takes effect. */
+  signal?: AbortSignal
+  /** Per-call sandbox policy interpreted by a confining provider. */
+  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
+}
+
 /** Matching policy for a literal edit request. */
 export interface FsEditMatchOptions {
   /** Whether matching stops at LF-normalized exact text or uses safe fallbacks. */
@@ -182,6 +219,8 @@ export interface FsWriteOutcome {
   before: string | null
   /** The file's content AFTER the write, LF-normalized to share `before`'s diff basis. */
   after: string
+  /** Recoverable pre-mutation bytes, or null for a create or disabled backup. */
+  backup: FsBackupRef | null
 }
 
 /** A literal-replacement edit request. */
@@ -210,6 +249,8 @@ export interface FsEditOutcome {
   after: string
   /** The first cumulative strategy that produced the authoritative match set. */
   matchStrategy: FsEditMatchStrategy
+  /** Recoverable pre-mutation bytes, or null when backup was disabled. */
+  backup: FsBackupRef | null
 }
 
 /**

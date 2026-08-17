@@ -74,10 +74,10 @@ async function setup(
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   if (options.sandboxMode === undefined) {
-    await ctx.plugin(LocalFileSystem, { cwd: root })
+    await ctx.plugin(LocalFileSystem, { cwd: root, backupRoot: join(root, '.backups') })
   } else {
     await ctx.plugin(SandboxPolicy, { mode: options.sandboxMode, workspaceRoot: root })
-    await ctx.plugin(SandboxedFileSystem, { cwd: root })
+    await ctx.plugin(SandboxedFileSystem, { cwd: root, backupRoot: join(root, '.backups') })
   }
   if (options.fsPolicy === true) await ctx.plugin(FsPolicy)
   const fiber = await ctx.plugin(ToolStrReplaceEditor, config)
@@ -181,18 +181,18 @@ describe('tool-str-replace-editor', () => {
       path: sample,
       old_str: 'two',
       new_str: 'TWO',
-    }))).toBe(`The file ${sample} has been edited successfully.`)
+    }))).toMatch(new RegExp(`^The file ${sample.replaceAll('\\', '\\\\')} has been edited successfully\\. Backup: .+\\.bak \\(14 bytes\\)\\.$`))
     expect(text(await call(ctx, owner, {
       command: 'str_replace',
       path: sample,
       old_str: 'TWO',
-    }))).toBe(`The file ${sample} has been edited successfully.`)
+    }))).toContain(`The file ${sample} has been edited successfully. Backup:`)
     expect(text(await call(ctx, owner, {
       command: 'insert',
       path: sample,
       insert_line: 1,
       new_str: 'between',
-    }))).toBe(`The file ${sample} has been edited successfully.`)
+    }))).toContain(`The file ${sample} has been edited successfully. Backup:`)
     expect(await readFile(sample, 'utf8')).toBe('one\nbetween\n\nthree\n')
   })
 
@@ -538,7 +538,7 @@ describe('tool-str-replace-editor', () => {
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
-    await ctx.plugin(LocalFileSystem, { cwd: root })
+    await ctx.plugin(LocalFileSystem, { cwd: root, backupRoot: join(root, '.backups') })
     Object.defineProperty(ctx.fs, 'sandboxMode', { value: 'read-only' })
 
     await expect(ctx.plugin(ToolStrReplaceEditor))

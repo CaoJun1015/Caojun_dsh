@@ -7,15 +7,20 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { posix } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import { applyTextEdit, FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
   FsDirEntry,
   FsEditOutcome,
+  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
   FsTarget,
+  FsBackupRef,
   FsWriteIntent,
+  FsWriteOptions,
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 import {
@@ -30,6 +35,18 @@ import type { EntryInfo, Sandbox } from '@deepseek-ai/dsh-e2b'
 const VERSION_METADATA_KEY = 'dsh-version'
 const BINARY_SAMPLE_BYTES = 8192
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
+/** Configuration for private backups inside the E2B sandbox. */
+export interface Config {
+  /** Whether required mutation backups can be created. Defaults to true. */
+  backupEnabled?: boolean
+  /** Sandbox-local private backup root. Defaults to `/tmp/dsh-backups`. */
+  backupRoot?: string
+  /** Number of newest backups retained per canonical target. Defaults to 3. */
+  backupVersionsPerTarget?: number
+}
+
+type ResolvedConfig = Required<Config>
 
 function assertNotAborted(signal: AbortSignal | undefined, operation: string): void {
   if (signal?.aborted === true) throw new FsError(`${operation} aborted`, 'FS_ABORTED')
@@ -149,8 +166,26 @@ function mapError(error: unknown, operation: string, displayPath: string, signal
 /** Remote filesystem backend sharing the sandbox owned by `ctx.e2b`. */
 export class E2BFileSystem extends FileSystem {
   static inject = ['e2b']
+  static Config: z<Config> = z.object({
+    backupEnabled: z.boolean().default(true),
+    backupRoot: z.string().default('/tmp/dsh-backups'),
+    backupVersionsPerTarget: z.number().default(3),
+  })
 
   private readonly locks = new Map<string, Promise<unknown>>()
+  private readonly config: ResolvedConfig
+
+  constructor(ctx: Context, config: Config) {
+    super(ctx)
+    const resolved = config as ResolvedConfig
+    if (!posix.isAbsolute(resolved.backupRoot)) {
+      throw new Error('fs-e2b: backupRoot must be an absolute sandbox path')
+    }
+    if (!Number.isSafeInteger(resolved.backupVersionsPerTarget) || resolved.backupVersionsPerTarget <= 0) {
+      throw new Error('fs-e2b: backupVersionsPerTarget must be a positive safe integer')
+    }
+    this.config = resolved
+  }
 
   override async resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget> {
     assertNotAborted(opts?.signal, 'resolve')
@@ -355,28 +390,34 @@ export class E2BFileSystem extends FileSystem {
   override async writeText(
     target: FsTarget,
     content: string,
-    expected?: FsWriteIntent,
-    signal?: AbortSignal,
+    options: FsWriteOptions,
   ): Promise<FsWriteOutcome> {
     return this.withLock(String(target.targetKey), async () => {
+      const { intent, signal } = options
       const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
       if (existing !== undefined && entryType(existing) !== 'file') {
         throw new FsError(`cannot write "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
-      this.checkWriteIntent(existing, expected, target)
+      this.checkWriteIntent(existing, intent, target)
       const before = existing === undefined ? null : await this.readForDiff(target, signal)
+      const backup = existing !== undefined && options.backup === 'required'
+        ? await this.createBackup(target, entryVersion(existing), signal)
+        : null
+      if (backup !== null && existing !== undefined) await this.recheckAfterBackup(target, existing, 'write', signal)
       const version = await this.writeAtomic(
         target,
         content,
         existing,
-        expected?.kind === 'createIfAbsent',
+        intent?.kind === 'createIfAbsent',
         signal,
       )
+      if (backup !== null) await this.pruneBackups(target)
       return {
         operation: existing === undefined ? 'create' : 'update',
         version,
         before,
         after: normalizeLineEndings(content),
+        backup,
       }
     })
   }
@@ -384,10 +425,10 @@ export class E2BFileSystem extends FileSystem {
   override async editText(
     target: FsTarget,
     edit: FsEditRequest,
-    expected?: { version: ReturnType<typeof FsVersion> },
-    signal?: AbortSignal,
+    options: FsEditOptions,
   ): Promise<FsEditOutcome> {
     return this.withLock(String(target.targetKey), async () => {
+      const { signal } = options
       const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
       if (existing === undefined) {
         throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
@@ -395,15 +436,20 @@ export class E2BFileSystem extends FileSystem {
       if (entryType(existing) !== 'file') {
         throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
-      if (expected !== undefined && entryVersion(existing) !== expected.version) {
+      if (options.version !== undefined && entryVersion(existing) !== options.version) {
         throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
       }
       const raw = await this.readForEdit(target, signal)
       const before = normalizeLineEndings(raw)
       const edited = applyTextEdit(before, edit, target.displayPath)
+      const backup = options.backup === 'required'
+        ? await this.createBackup(target, entryVersion(existing), signal)
+        : null
+      if (backup !== null) await this.recheckAfterBackup(target, existing, 'edit', signal)
       const storage = restoreLineEndings(edited.content, detectsCrlf(raw))
       const version = await this.writeAtomic(target, storage, existing, false, signal)
-      return { version, before, after: edited.content, matchStrategy: edited.matchStrategy }
+      if (backup !== null) await this.pruneBackups(target)
+      return { version, before, after: edited.content, matchStrategy: edited.matchStrategy, backup }
     })
   }
 
@@ -460,6 +506,73 @@ export class E2BFileSystem extends FileSystem {
       if (existing === undefined || entryVersion(existing) !== expected.version) {
         throw new FsError(`cannot write "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
       }
+    }
+  }
+
+  private backupDirectory(target: FsTarget): string {
+    const targetHash = createHash('sha256').update(String(target.targetKey)).digest('hex')
+    return posix.join(this.config.backupRoot, targetHash)
+  }
+
+  private async createBackup(
+    target: FsTarget,
+    sourceVersion: ReturnType<typeof FsVersion>,
+    signal?: AbortSignal,
+  ): Promise<FsBackupRef> {
+    if (!this.config.backupEnabled) {
+      throw new FsError(`cannot back up "${target.displayPath}": E2B backup storage is disabled`, 'FS_IO_ERROR')
+    }
+    assertNotAborted(signal, 'backup')
+    const sandbox = await this.ctx.e2b.getSandbox()
+    const directory = this.backupDirectory(target)
+    const backupPath = posix.join(directory, `${Date.now()}-${randomUUID()}-${randomUUID()}.bak`)
+    try {
+      const result = await sandbox.commands.run([
+        'set -e',
+        'umask 077',
+        `mkdir -p -- ${quoteE2BShellArg(this.config.backupRoot)} ${quoteE2BShellArg(directory)}`,
+        `chmod 700 -- ${quoteE2BShellArg(this.config.backupRoot)} ${quoteE2BShellArg(directory)}`,
+        `cp --reflink=auto -- ${quoteE2BShellArg(String(target.targetKey))} ${quoteE2BShellArg(backupPath)}`,
+        `chmod 600 -- ${quoteE2BShellArg(backupPath)}`,
+        `sync -f -- ${quoteE2BShellArg(backupPath)}`,
+        `stat -c %s -- ${quoteE2BShellArg(backupPath)}`,
+      ].join('; '), commandOpts(signal))
+      const bytes = Number(result.stdout.trim())
+      if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error('backup byte count was invalid')
+      return { path: backupPath, bytes, sourceVersion }
+    } catch (error: unknown) {
+      try {
+        await sandbox.files.remove(backupPath)
+      } catch (_partialBackupAbsentOrCleanupFailed) {
+        // Cleanup is limited to the private random backup leaf; the copy failure remains authoritative.
+      }
+      throw mapError(error, 'back up', target.displayPath, signal)
+    }
+  }
+
+  private async recheckAfterBackup(
+    target: FsTarget,
+    existing: EntryInfo,
+    operation: 'write' | 'edit',
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const current = await this.probe(String(target.targetKey), target.displayPath, signal)
+    if (current === undefined || entryVersion(current) !== entryVersion(existing)) {
+      throw new FsError(`cannot ${operation} "${target.displayPath}": file changed while it was being backed up`, 'FS_STALE_VERSION')
+    }
+  }
+
+  private async pruneBackups(target: FsTarget): Promise<void> {
+    const sandbox = await this.ctx.e2b.getSandbox()
+    const directory = this.backupDirectory(target)
+    const keepFrom = this.config.backupVersionsPerTarget + 1
+    try {
+      await sandbox.commands.run(
+        `find ${quoteE2BShellArg(directory)} -maxdepth 1 -type f -name '*.bak' -printf '%T@ %p\\0' | sort -zrn | tail -z -n +${keepFrom} | cut -z -d ' ' -f 2- | xargs -0r rm --`,
+        commandOpts(undefined),
+      )
+    } catch (error: unknown) {
+      this.ctx.logger.warn(`fs-e2b: failed to prune backups for ${target.displayPath}: ${String(error)}`)
     }
   }
 

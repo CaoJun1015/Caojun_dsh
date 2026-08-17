@@ -36,7 +36,10 @@ let terminalId: Awaited<ReturnType<typeof ctx.terminals.spawn>>['sessionId'] | u
 try {
   const sandbox = await ctx.e2b.getSandbox()
   const fromFs = await ctx.fs.resolve('from-fs.txt')
-  const written = await ctx.fs.writeText(fromFs, 'written-by-fs\n', { kind: 'createIfAbsent' })
+  const written = await ctx.fs.writeText(fromFs, 'written-by-fs\n', {
+    intent: { kind: 'createIfAbsent' },
+    backup: 'required',
+  })
   const observed = await ctx.fs.stat(fromFs)
   if (observed?.version !== written.version) {
     throw new Error(`E2B rename did not preserve version metadata: ${JSON.stringify({ written, observed })}`)
@@ -44,7 +47,7 @@ try {
   await ctx.fs.editText(
     fromFs,
     { oldString: 'written-by-fs', newString: 'versioned-by-fs', replaceAll: false },
-    { version: observed.version },
+    { version: observed.version, backup: 'required' },
   )
   const bashRead = await ctx.shell.run(ctx.shell.resolve({ command: 'cat from-fs.txt' }))
   if (bashRead.exitCode !== 0 || bashRead.stdout.text !== 'versioned-by-fs\n') {
@@ -121,9 +124,9 @@ try {
 
   const lspFixture = await readFile(new URL('./fixture-lsp.mjs', import.meta.url), 'utf8')
   const remoteLspFixture = await ctx.fs.resolve('fixture-lsp.mjs')
-  await ctx.fs.writeText(remoteLspFixture, lspFixture, { kind: 'createIfAbsent' })
+  await ctx.fs.writeText(remoteLspFixture, lspFixture, { intent: { kind: 'createIfAbsent' }, backup: 'required' })
   const remoteSource = await ctx.fs.resolve('multibyte # file.ts')
-  await ctx.fs.writeText(remoteSource, 'const café = "你好"\nconsole.log(café)\n', { kind: 'createIfAbsent' })
+  await ctx.fs.writeText(remoteSource, 'const café = "你好"\nconsole.log(café)\n', { intent: { kind: 'createIfAbsent' }, backup: 'required' })
   const hover = await ctx.lsp.query({
     operation: 'hover',
     filePath: 'multibyte # file.ts',

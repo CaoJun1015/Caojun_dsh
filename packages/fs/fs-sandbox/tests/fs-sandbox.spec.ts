@@ -9,29 +9,68 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, parse } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
+import type { FsEditOptions, FsEditRequest, FsWriteIntent, FsWriteOptions } from '@deepseek-ai/dsh-fs'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
+
+class TestSandboxedFileSystem extends SandboxedFileSystem {
+  override writeText(
+    target: FsTarget,
+    content: string,
+    optionsOrIntent?: FsWriteOptions | FsWriteIntent,
+    signal?: AbortSignal,
+    sandboxPolicy?: FsWriteOptions['sandboxPolicy'],
+  ) {
+    const options: FsWriteOptions = optionsOrIntent !== undefined && 'backup' in optionsOrIntent
+      ? optionsOrIntent
+      : {
+        ...optionsOrIntent === undefined ? {} : { intent: optionsOrIntent },
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+      }
+    return super.writeText(target, content, options)
+  }
+
+  override editText(
+    target: FsTarget,
+    edit: FsEditRequest,
+    optionsOrVersion?: FsEditOptions | { version: import('@deepseek-ai/dsh-fs').FsVersion },
+    signal?: AbortSignal,
+    sandboxPolicy?: FsEditOptions['sandboxPolicy'],
+  ) {
+    const options: FsEditOptions = optionsOrVersion !== undefined && 'backup' in optionsOrVersion
+      ? optionsOrVersion
+      : {
+        ...optionsOrVersion,
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+      }
+    return super.editText(target, edit, options)
+  }
+}
 
 let base: string
 let workspace: string
 let outside: string
 let ctx: Context
-let fs: SandboxedFileSystem
+let fs: TestSandboxedFileSystem
 let fiber: Awaited<ReturnType<Context['plugin']>>
 
 async function boot(mode: SandboxMode): Promise<void> {
   ctx = new Context()
   await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: workspace })
-  fiber = await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
-  fs = ctx.fs as SandboxedFileSystem
+  fiber = await ctx.plugin(TestSandboxedFileSystem, { cwd: workspace, backupRoot: join(workspace, '.backups') })
+  fs = ctx.fs as TestSandboxedFileSystem
 }
 
 beforeEach(async () => {
@@ -70,6 +109,15 @@ describe('read-only', () => {
     const path = join(workspace, 'denied.txt')
     await expect(fs.writeText(await target(path), 'x')).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
     expect(existsSync(path)).toBe(false)
+  })
+
+  it('runs the fresh-target containment check before a required backup side effect', async () => {
+    const path = join(workspace, 'existing.txt')
+    await writeFile(path, 'original')
+    await expect(fs.writeText(await target(path), 'changed', { backup: 'required' }))
+      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    expect(await readFile(path, 'utf8')).toBe('original')
+    await expect(access(join(workspace, '.backups'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('denies edit of an existing file (the content is unchanged)', async () => {
@@ -176,7 +224,7 @@ describe('workspace-write with the filesystem root as the workspace (a root endi
     const rootFs = rootCtx.fs as SandboxedFileSystem
     try {
       const path = join(base, 'anywhere.txt') // under HOME, outside temp — allowed only via the filesystem root
-      await rootFs.writeText(await rootFs.resolve(path), 'anywhere')
+      await rootFs.writeText(await rootFs.resolve(path), 'anywhere', { backup: 'disabled' })
       expect(await readFile(path, 'utf8')).toBe('anywhere')
     } finally {
       await rootFiber.dispose()

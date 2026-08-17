@@ -10,10 +10,45 @@ import {
 } from '@deepseek-ai/dsh-e2b'
 import type E2BRuntime from '@deepseek-ai/dsh-e2b'
 import { FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
+import type { FsEditOptions, FsEditRequest, FsTarget, FsWriteIntent, FsWriteOptions } from '@deepseek-ai/dsh-fs'
 import E2BFileSystem from '@deepseek-ai/dsh-fs-e2b'
 import * as E2BFsInvariant from '../src/invariant.ts'
 import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import { describe, expect, it, vi } from 'vitest'
+
+class TestE2BFileSystem extends E2BFileSystem {
+  override writeText(
+    target: FsTarget,
+    content: string,
+    optionsOrIntent?: FsWriteOptions | FsWriteIntent,
+    signal?: AbortSignal,
+  ) {
+    const options: FsWriteOptions = optionsOrIntent !== undefined && 'backup' in optionsOrIntent
+      ? optionsOrIntent
+      : {
+        ...optionsOrIntent === undefined ? {} : { intent: optionsOrIntent },
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+      }
+    return super.writeText(target, content, options)
+  }
+
+  override editText(
+    target: FsTarget,
+    edit: FsEditRequest,
+    optionsOrVersion?: FsEditOptions | { version: FsVersion },
+    signal?: AbortSignal,
+  ) {
+    const options: FsEditOptions = optionsOrVersion !== undefined && 'backup' in optionsOrVersion
+      ? optionsOrVersion
+      : {
+        ...optionsOrVersion,
+        backup: 'disabled',
+        ...signal === undefined ? {} : { signal },
+      }
+    return super.editText(target, edit, options)
+  }
+}
 
 interface RemoteNode {
   type: FileType
@@ -58,6 +93,7 @@ class FakeRemote {
     | { path: string; kind: 'directory' }
     | undefined
   guardedLinkOutput: string | undefined
+  mutateAfterBackup: { path: string; data: string } | undefined
   disappearOnInfo = new Set<string>()
   private clock = 1
 
@@ -92,6 +128,10 @@ class FakeRemote {
     const node = this.required(path)
     node.data = bytes(data)
     node.modified = this.clock++
+  }
+
+  content(path: string): Uint8Array {
+    return this.required(path).data
   }
 
   private required(path: string): RemoteNode {
@@ -259,6 +299,36 @@ class FakeRemote {
             stderr: '',
           }
         }
+        const backupCopy = /cp --reflink=auto -- '([^']+)' '([^']+)'/.exec(command)
+        if (backupCopy !== null) {
+          const source = this.required(backupCopy[1]!)
+          const destination = backupCopy[2]!
+          const directory = posix.dirname(destination)
+          if (!this.nodes.has('/tmp')) this.dir('/tmp')
+          if (!this.nodes.has('/tmp/dsh-backups')) this.dir('/tmp/dsh-backups')
+          if (!this.nodes.has(directory)) this.dir(directory)
+          this.nodes.set(destination, {
+            type: FileType.FILE,
+            data: Uint8Array.from(source.data),
+            mode: 0o600,
+            modified: this.clock++,
+          })
+          if (this.mutateAfterBackup !== undefined) {
+            this.mutate(this.mutateAfterBackup.path, this.mutateAfterBackup.data)
+            this.mutateAfterBackup = undefined
+          }
+          return { exitCode: 0, stdout: `${source.data.byteLength}\n`, stderr: '' }
+        }
+        const prune = /^find '([^']+)' .* tail -z -n \+(\d+) /.exec(command)
+        if (prune !== null) {
+          const directory = prune[1]!
+          const keep = Number(prune[2]!) - 1
+          const backups = [...this.nodes.entries()]
+            .filter(([path, node]) => posix.dirname(path) === directory && path.endsWith('.bak') && node.type === FileType.FILE)
+            .sort((left, right) => right[1].modified - left[1].modified)
+          for (const [path] of backups.slice(keep)) this.nodes.delete(path)
+          return { exitCode: 0, stdout: '', stderr: '' }
+        }
         const chmod = /^chmod ([0-7]+) -- '([^']+)'$/.exec(command)
         if (chmod !== null) this.required(chmod[2]!).mode = Number.parseInt(chmod[1]!, 8)
         const guardedLink = new RegExp(
@@ -303,7 +373,7 @@ class FakeRemote {
   } as unknown as Sandbox
 }
 
-async function setup(remote = new FakeRemote()): Promise<{ ctx: Context; fs: E2BFileSystem; remote: FakeRemote }> {
+async function setup(remote = new FakeRemote()): Promise<{ ctx: Context; fs: TestE2BFileSystem; remote: FakeRemote }> {
   const ctx = new Context()
   const runtime = {
     cwd: '/workspace',
@@ -311,8 +381,8 @@ async function setup(remote = new FakeRemote()): Promise<{ ctx: Context; fs: E2B
     getSandbox: async () => remote.sandbox,
   } as unknown as E2BRuntime
   ctx.provide('e2b', runtime)
-  await ctx.plugin(E2BFileSystem)
-  return { ctx, fs: ctx.fs as E2BFileSystem, remote }
+  await ctx.plugin(TestE2BFileSystem)
+  return { ctx, fs: ctx.fs as TestE2BFileSystem, remote }
 }
 
 async function expectCode(promise: Promise<unknown>, code: string): Promise<void> {
@@ -744,6 +814,62 @@ describe('E2BFileSystem atomic writes and edits', () => {
     ])
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+  })
+})
+
+describe('E2B mutation backups', () => {
+  it('copies exact bytes before updates, skips creates, and retains three versions', async () => {
+    const { fs, remote } = await setup()
+    remote.file('/workspace/existing.bin', [0, 255, 13, 10])
+    const target = await fs.resolve('existing.bin')
+    const paths: string[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const before = Uint8Array.from(remote.content('/workspace/existing.bin'))
+      const info = await fs.stat(target)
+      if (info === undefined) throw new Error('expected remote target')
+      const outcome = await fs.writeText(target, `value-${index}`, {
+        intent: { kind: 'replaceIfVersion', version: info.version },
+        backup: 'required',
+      })
+      if (outcome.backup === null) throw new Error('expected remote backup')
+      expect(remote.content(outcome.backup.path)).toEqual(before)
+      expect(outcome.backup.bytes).toBe(before.byteLength)
+      paths.push(outcome.backup.path)
+    }
+    expect(remote.nodes.has(paths[0]!)).toBe(false)
+    for (const path of paths.slice(1)) expect(remote.nodes.has(path)).toBe(true)
+
+    const created = await fs.writeText(await fs.resolve('created.txt'), 'new', {
+      intent: { kind: 'createIfAbsent' },
+      backup: 'required',
+    })
+    expect(created.backup).toBeNull()
+  })
+
+  it('does not back up failed matches and blocks target publication on backup failure or a stale recheck', async () => {
+    const { fs, remote } = await setup()
+    remote.file('/workspace/story.txt', 'original')
+    const target = await fs.resolve('story.txt')
+    const info = await fs.stat(target)
+    if (info === undefined) throw new Error('expected remote target')
+    await expect(fs.editText(target, {
+      oldString: 'absent', newString: 'x', replaceAll: false,
+    }, { version: info.version, backup: 'required' })).rejects.toMatchObject({ code: 'FS_EDIT_NOT_FOUND' })
+    expect(remote.commands.some(command => command.includes('cp --reflink'))).toBe(false)
+
+    remote.nextCommandError = commandError(1, 'backup unavailable')
+    await expect(fs.writeText(target, 'replacement', {
+      intent: { kind: 'replaceIfVersion', version: info.version },
+      backup: 'required',
+    })).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
+    expect(new TextDecoder().decode(remote.content('/workspace/story.txt'))).toBe('original')
+
+    remote.mutateAfterBackup = { path: '/workspace/story.txt', data: 'external' }
+    await expect(fs.writeText(target, 'ours', {
+      intent: { kind: 'replaceIfVersion', version: info.version },
+      backup: 'required',
+    })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    expect(new TextDecoder().decode(remote.content('/workspace/story.txt'))).toBe('external')
   })
 })
 

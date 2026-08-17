@@ -130,7 +130,7 @@ class TestFileSystem extends FileSystem {
   override async writeText(target: FsTarget, content: string): Promise<FsWriteOutcome> {
     await mkdir(dirname(target.displayPath), { recursive: true })
     await writeFile(target.displayPath, content)
-    return { operation: 'create', version: FsVersion('test'), before: null, after: content }
+    return { operation: 'create', version: FsVersion('test'), before: null, after: content, backup: null }
   }
 
   override async editText(_target: FsTarget, _request: FsEditRequest): Promise<FsEditOutcome> {

@@ -33,13 +33,19 @@ export function parseWriteArgs(args: { file_path: string; content: string }): { 
  * @param outcome - the write outcome; its `operation` selects the Created/Updated wording.
  * @returns the model-facing confirmation envelope (no file content is echoed back).
  */
-export function formatWriteOutput(displayPath: string, outcome: Pick<FsWriteOutcome, 'operation'>): string {
+export function formatWriteOutput(
+  displayPath: string,
+  outcome: Pick<FsWriteOutcome, 'operation'> & { backup: Pick<NonNullable<FsWriteOutcome['backup']>, 'path' | 'bytes'> | null },
+): string {
   const verb = outcome.operation === 'create' ? 'Created' : 'Updated'
+  const recovery = outcome.backup === null
+    ? ''
+    : `\n<backup path="${outcome.backup.path}" bytes="${outcome.backup.bytes}" />`
   return `<path>${displayPath}</path>
 <type>file</type>
 <content>
 ${verb} file
-</content>`
+</content>${recovery}`
 }
 
 /**
@@ -59,7 +65,7 @@ interface WriteToolArgs {
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
  */
-export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void {
+export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backupBeforeMutation: boolean): void {
   ctx.systemPrompt.section({
     name: 'tool:write',
     order: 101,
@@ -89,6 +95,20 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void
             ],
           },
           after: { type: 'string', required: true },
+          backup: {
+            required: true,
+            oneOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  path: { type: 'string', required: true },
+                  bytes: { type: 'integer', required: true },
+                },
+              },
+            ],
+          },
         },
       },
       render: (_args, value) => [{ type: 'text', text: formatWriteOutput(value.path, value) }],
@@ -111,7 +131,12 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void
       const intent = await ctx.waterfall('fs/write-intent', target, exec, () => undefined)
       let outcome: FsWriteOutcome
       try {
-        outcome = await ctx.fs.writeText(target, input.content, intent, exec.signal, sandboxPolicy)
+        outcome = await ctx.fs.writeText(target, input.content, {
+          ...intent === undefined ? {} : { intent },
+          backup: backupBeforeMutation ? 'required' : 'disabled',
+          signal: exec.signal,
+          ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
+        })
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
         // recognizes it from bash); stale/not-observed failures gain their
@@ -125,6 +150,9 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void
         operation: outcome.operation,
         before: outcome.before,
         after: outcome.after,
+        backup: outcome.backup === null
+          ? null
+          : { path: outcome.backup.path, bytes: outcome.backup.bytes },
       }
     },
     // Pure display: a diff card. A call-time presenter has no access to prior
