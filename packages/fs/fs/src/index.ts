@@ -24,11 +24,21 @@ import type {
 } from './types.ts'
 
 export {
+  applyTextEdit,
+} from './edit-match.ts'
+export type {
+  FsAppliedTextEdit,
+} from './edit-match.ts'
+export {
   FsError,
   FsTargetKey,
   FsVersion,
 } from './types.ts'
 export type {
+  FsEditCandidate,
+  FsEditErrorDetails,
+  FsEditMatchOptions,
+  FsEditMatchStrategy,
   FsEditOutcome,
   FsEditRequest,
   FsDirEntry,

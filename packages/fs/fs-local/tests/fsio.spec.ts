@@ -11,7 +11,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:net'
 import {
-  applyLiteralEdit,
   listDirectory,
   probe,
   probeNoFollow,
@@ -867,40 +866,13 @@ describe('writeFileAtomic — temp-file safety', () => {
   })
 })
 
-describe('applyLiteralEdit', () => {
-  it('replaces a unique match', () => {
-    expect(applyLiteralEdit('a b c', 'b', 'X', false, 'f')).toEqual({ content: 'a X c', replacements: 1 })
-  })
-
-  it('rejects zero matches', () => {
-    expect(() => applyLiteralEdit('a b c', 'z', 'X', false, 'f')).toThrow(expect.objectContaining({ code: 'FS_EDIT_NOT_FOUND' }))
-  })
-
-  it('rejects an empty oldString without scanning forever', () => {
-    expect(() => applyLiteralEdit('a b c', '', 'X', false, 'f')).toThrow(expect.objectContaining({ code: 'FS_EDIT_NOT_FOUND' }))
-  })
-
-  it('rejects multiple matches without replaceAll', () => {
-    expect(() => applyLiteralEdit('a a a', 'a', 'X', false, 'f')).toThrow(expect.objectContaining({ code: 'FS_AMBIGUOUS_EDIT' }))
-  })
-
-  it('replaces all matches with replaceAll', () => {
-    expect(applyLiteralEdit('a a a', 'a', 'X', true, 'f')).toEqual({ content: 'X X X', replacements: 3 })
-  })
-
-  it('matches across normalized line endings', () => {
-    expect(applyLiteralEdit('one\ntwo', 'one\ntwo', 'x', false, 'f').replacements).toBe(1)
-  })
-})
-
 describe('readForEdit + restoreLineEndings', () => {
   it('round-trips CRLF: matches on LF, writes back CRLF', async () => {
     const file = join(dir, 'crlf.txt')
     await writeFile(file, 'one\r\ntwo\r\n')
     const original = await readForEdit(file, file)
     expect(original.lineEndings).toBe('CRLF')
-    const edited = applyLiteralEdit(original.content, 'two', 'TWO', false, file)
-    expect(restoreLineEndings(edited.content, original.lineEndings)).toBe('one\r\nTWO\r\n')
+    expect(restoreLineEndings(original.content.replace('two', 'TWO'), original.lineEndings)).toBe('one\r\nTWO\r\n')
   })
 
   it('rejects a binary file and invalid UTF-8', async () => {

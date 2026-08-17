@@ -124,6 +124,47 @@ export type FsWriteIntent =
   | { kind: 'createIfAbsent' }
   | { kind: 'replaceIfVersion'; version: FsVersion }
 
+/** Matching policy for a literal edit request. */
+export interface FsEditMatchOptions {
+  /** Whether matching stops at LF-normalized exact text or uses safe fallbacks. */
+  mode: 'exact' | 'progressive'
+  /** Maximum approximate candidates returned after every automatic strategy fails. */
+  candidateLimit: number
+  /** Maximum Unicode-code-point edit distance for an approximate candidate. */
+  candidateMaxDistance: number
+  /** Maximum Unicode code points retained in each candidate preview. */
+  candidatePreviewChars: number
+}
+
+/** The successful level in the cumulative literal-edit matching sequence. */
+export type FsEditMatchStrategy =
+  | 'exact'
+  | 'trimmed'
+  | 'lineTrailingWhitespace'
+  | 'fullWidthAscii'
+
+/** One non-authoritative nearby line or multiline window for a failed edit. */
+export interface FsEditCandidate {
+  /** One-based first line of the candidate window. */
+  line: number
+  /** Unicode-code-point Levenshtein distance from the normalized search text. */
+  distance: number
+  /** Bounded source-text preview of the candidate window. */
+  preview: string
+}
+
+/** Structured diagnostics attached to literal-edit matching failures. */
+export interface FsEditErrorDetails {
+  /** Backend display path of the file that was searched. */
+  path: string
+  /** Cumulative automatic strategies attempted before the failure. */
+  attemptedStrategies: readonly FsEditMatchStrategy[]
+  /** Nearby candidates, ordered by distance and then line number. */
+  candidates: readonly FsEditCandidate[]
+  /** Number of authoritative matches when the edit was ambiguous. */
+  matchCount?: number
+}
+
 /** Outcome of a full-file write. */
 export interface FsWriteOutcome {
   /** Whether the write created a new file or replaced an existing one. */
@@ -151,6 +192,8 @@ export interface FsEditRequest {
   newString: string
   /** Replace every match instead of requiring exactly one. */
   replaceAll: boolean
+  /** Literal matching and failure-diagnostic policy. Omission means exact matching. */
+  matchOptions?: FsEditMatchOptions
 }
 
 /** Outcome of a literal edit. */
@@ -165,6 +208,8 @@ export interface FsEditOutcome {
   before: string
   /** The file's content AFTER the edit. */
   after: string
+  /** The first cumulative strategy that produced the authoritative match set. */
+  matchStrategy: FsEditMatchStrategy
 }
 
 /**
@@ -195,9 +240,12 @@ export type FsErrorCode =
  */
 export class FsError extends HarnessError {
   override readonly code: FsErrorCode
+  /** Structured literal-edit diagnostics, when this is a matching failure. */
+  readonly details: FsEditErrorDetails | undefined
 
-  constructor(message: string, code: FsErrorCode, options?: ErrorOptions) {
+  constructor(message: string, code: FsErrorCode, options?: ErrorOptions & { details?: FsEditErrorDetails }) {
     super(message, code, options)
     this.code = code
+    this.details = options?.details
   }
 }

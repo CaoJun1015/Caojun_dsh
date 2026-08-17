@@ -9,7 +9,7 @@ import { constants as bufferConstants } from 'node:buffer'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import z from '@deepseek-ai/schemastery'
-import { FileSystem, FsError, FsVersion } from '@deepseek-ai/dsh-fs'
+import { applyTextEdit, FileSystem, FsError, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
   FsDirEntry,
   FsEditOutcome,
@@ -21,7 +21,6 @@ import type {
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 import {
-  applyLiteralEdit,
   listDirectory,
   normalizeLineEndings,
   probe,
@@ -239,7 +238,7 @@ export class LocalFileSystem extends FileSystem {
       }
 
       const original = await readForEdit(target.targetKey, target.displayPath, signal)
-      const edited = applyLiteralEdit(original.content, edit.oldString, edit.newString, edit.replaceAll, target.displayPath)
+      const edited = applyTextEdit(original.content, edit, target.displayPath)
       const content = restoreLineEndings(edited.content, original.lineEndings)
       await writeFileAtomic(target.targetKey, content, existing.mode, signal, this.internals)
 
@@ -250,6 +249,7 @@ export class LocalFileSystem extends FileSystem {
         // line-ending restoration is a storage detail the diff ignores.
         before: original.content,
         after: edited.content,
+        matchStrategy: edited.matchStrategy,
       }
     })
   }

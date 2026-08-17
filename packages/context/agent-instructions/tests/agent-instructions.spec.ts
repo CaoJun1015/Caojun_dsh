@@ -144,7 +144,7 @@ class RecordingFileSystem extends FileSystem {
   }
 
   override async editText(_target: FsTarget, _edit: FsEditRequest): Promise<FsEditOutcome> {
-    return { version: FsVersion('unused'), before: '', after: '' }
+    return { version: FsVersion('unused'), before: '', after: '', matchStrategy: 'exact' }
   }
 }
 

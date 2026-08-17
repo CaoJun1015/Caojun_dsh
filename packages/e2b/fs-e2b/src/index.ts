@@ -7,7 +7,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { posix } from 'node:path'
-import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
+import { applyTextEdit, FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
   FsDirEntry,
   FsEditOutcome,
@@ -144,27 +144,6 @@ function mapError(error: unknown, operation: string, displayPath: string, signal
     return new FsError(`cannot ${operation} "${displayPath}": permission denied`, 'FS_PERMISSION_DENIED', { cause: error })
   }
   return new FsError(`cannot ${operation} "${displayPath}": ${String(error)}`, 'FS_IO_ERROR', { cause: error })
-}
-
-function literalEdit(content: string, request: FsEditRequest, displayPath: string): string {
-  const oldString = normalizeLineEndings(request.oldString)
-  const newString = normalizeLineEndings(request.newString)
-  if (oldString.length === 0) {
-    throw new FsError(`cannot edit "${displayPath}": old_string must be non-empty`, 'FS_EDIT_NOT_FOUND')
-  }
-  let matches = 0
-  let offset = 0
-  while (true) {
-    const found = content.indexOf(oldString, offset)
-    if (found < 0) break
-    matches += 1
-    offset = found + oldString.length
-  }
-  if (matches === 0) throw new FsError(`cannot edit "${displayPath}": old_string was not found`, 'FS_EDIT_NOT_FOUND')
-  if (!request.replaceAll && matches !== 1) {
-    throw new FsError(`cannot edit "${displayPath}": old_string matched ${matches} times`, 'FS_AMBIGUOUS_EDIT')
-  }
-  return request.replaceAll ? content.split(oldString).join(newString) : content.replace(oldString, newString)
 }
 
 /** Remote filesystem backend sharing the sandbox owned by `ctx.e2b`. */
@@ -421,10 +400,10 @@ export class E2BFileSystem extends FileSystem {
       }
       const raw = await this.readForEdit(target, signal)
       const before = normalizeLineEndings(raw)
-      const after = literalEdit(before, edit, target.displayPath)
-      const storage = restoreLineEndings(after, detectsCrlf(raw))
+      const edited = applyTextEdit(before, edit, target.displayPath)
+      const storage = restoreLineEndings(edited.content, detectsCrlf(raw))
       const version = await this.writeAtomic(target, storage, existing, false, signal)
-      return { version, before, after }
+      return { version, before, after: edited.content, matchStrategy: edited.matchStrategy }
     })
   }
 

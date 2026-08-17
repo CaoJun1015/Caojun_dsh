@@ -94,7 +94,7 @@ class FakeFs extends FileSystem {
     const content = this.files.get(target.targetKey) ?? ''
     const after = content.split(edit.oldString).join(edit.newString)
     this.files.set(target.targetKey, after)
-    return { version: FsVersion('v3'), before: content, after }
+    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact' }
   }
 }
 
@@ -427,7 +427,7 @@ describe('edit tool', () => {
     await call(ctx, 'read', { file_path: 'a.txt' }, { session })
     const result = await call(ctx, 'edit', { file_path: 'a.txt', old_string: 'a', new_string: 'b' }, { session })
     if (result.isError) throw new Error('expected edit success')
-    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b' })
+    expect(result.value).toEqual({ path: '/abs/a.txt', before: 'a', after: 'b', match_strategy: 'exact' })
     expect(text(result)).toBe('The file /abs/a.txt has been updated successfully.')
   })
 

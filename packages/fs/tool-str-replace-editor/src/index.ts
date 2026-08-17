@@ -7,7 +7,7 @@ import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsInfo, FsTarget, FsWriteIntent } from '@deepseek-ai/dsh-fs'
+import type { FsEditMatchOptions, FsInfo, FsTarget, FsWriteIntent } from '@deepseek-ai/dsh-fs'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
@@ -24,7 +24,7 @@ Custom editing tool for viewing, creating and editing files
 * If a \`command\` generates a long output, it will be truncated and marked with \`<response clipped>\`
 
 Notes for using the \`str_replace\` command:
-* The \`old_str\` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
+* The \`old_str\` parameter must identify one unique region. Progressive matching can ignore outer search whitespace, per-line trailing whitespace, and full-width ASCII differences; approximate candidates are suggestions only
 * If the \`old_str\` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in \`old_str\` to make it unique
 * The \`new_str\` parameter should contain the edited lines that should replace the \`old_str\`
 `.trim()
@@ -39,27 +39,20 @@ function codepointCompare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-function matchOffsets(content: string, search: string): number[] {
-  const offsets: number[] = []
-  let offset = 0
-  while (true) {
-    const match = content.indexOf(search, offset)
-    if (match < 0) return offsets
-    offsets.push(match)
-    offset = match + search.length
-  }
-}
-
-function lineNumbersAt(content: string, offsets: readonly number[]): number[] {
-  let line = 1
-  let cursor = 0
-  return offsets.map((offset) => {
-    while (cursor < offset) {
-      if (content[cursor] === '\n') line += 1
-      cursor += 1
-    }
-    return line
-  })
+function formatEditFsError(error: unknown): unknown {
+  if (!(error instanceof FsError) || error.details === undefined) return error
+  const candidates = error.details.candidates.length === 0
+    ? '  - No candidate within the configured edit-distance threshold.'
+    : error.details.candidates
+      .map(candidate => `  - line ${candidate.line}, distance ${candidate.distance}: ${JSON.stringify(candidate.preview)}`)
+      .join('\n')
+  return new FsError([
+    error.message.replaceAll('old_string', 'old_str'),
+    `  - Attempted strategies: ${error.details.attemptedStrategies.join(', ')}`,
+    `  - Closest candidate${error.details.candidates.length === 1 ? '' : 's'}:`,
+    candidates,
+    '  - Hint: view the file to confirm its current contents, then retry with a unique literal selection.',
+  ].join('\n'), error.code, { cause: error, details: error.details })
 }
 
 class MutationPolicy {
@@ -277,6 +270,7 @@ async function replaceInFile(
   path: string,
   oldStr: string | undefined,
   newStr: string | undefined,
+  matchOptions: FsEditMatchOptions,
   exec: ToolRunContext,
 ): Promise<string> {
   const sandboxPolicy = policy.resolve(exec)
@@ -284,42 +278,22 @@ async function replaceInFile(
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
   const oldValue = requiredForCommand(oldStr, 'old_str', 'str_replace', false)
   const newValue = newStr ?? ''
-  const info = await statExisting(ctx, target, 'str_replace', exec)
-  if (info.type !== 'file') {
-    throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
-  }
-  const before = await ctx.fs.readText(target, exec.signal)
-  const offsets = matchOffsets(before, oldValue)
-  const offset = offsets[0]
-  if (offset === undefined) {
-    throw new FsError(
-      `No replacement was performed, old_str \`${oldValue}\` did not appear verbatim in ${target.displayPath}.`,
-      'FS_EDIT_NOT_FOUND',
-    )
-  }
-  if (offsets.length > 1) {
-    const lines = lineNumbersAt(before, offsets)
-    throw new FsError(
-      `No replacement was performed. Multiple occurrences of old_str \`${oldValue}\` in lines [${lines.join(', ')}]. Please ensure it is unique`,
-      'FS_AMBIGUOUS_EDIT',
-    )
-  }
   let outcome
   try {
-    outcome = await ctx.fs.writeText(
+    outcome = await ctx.fs.editText(
       target,
-      before.slice(0, offset) + newValue + before.slice(offset + oldValue.length),
-      intent === undefined
-        ? { kind: 'replaceIfVersion', version: info.version }
-        : { kind: 'replaceIfVersion', version: intent.version },
+      { oldString: oldValue, newString: newValue, replaceAll: false, matchOptions },
+      intent,
       exec.signal,
       sandboxPolicy,
     )
   } catch (error: unknown) {
-    throw policy.mapError(error, sandboxPolicy)
+    throw formatEditFsError(policy.mapError(error, sandboxPolicy))
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-  return `The file ${target.displayPath} has been edited successfully.`
+  return outcome.matchStrategy === 'exact'
+    ? `The file ${target.displayPath} has been edited successfully.`
+    : `The file ${target.displayPath} has been edited successfully. Warning: the edit used the ${outcome.matchStrategy} fallback matching strategy.`
 }
 
 async function insertInFile(
@@ -367,6 +341,7 @@ async function insertInFile(
 interface ResolvedConfig {
   maxOutputChars: number
   description: string
+  editMatchOptions: FsEditMatchOptions
 }
 
 function presentEditorCall(args: {
@@ -473,6 +448,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             args.path,
             args.old_str,
             args.new_str,
+            config.editMatchOptions,
             exec,
           )
         case 'insert':
@@ -499,12 +475,24 @@ export interface Config {
   maxOutputChars?: number
   /** Model-facing tool description. */
   description?: string
+  /** Literal edit matching policy. Defaults to safe progressive matching. */
+  editMatchMode?: 'progressive' | 'exact'
+  /** Maximum nearby candidates returned after an edit miss. */
+  editCandidateLimit?: number
+  /** Maximum Unicode-code-point edit distance for nearby candidates. */
+  editCandidateMaxDistance?: number
+  /** Maximum Unicode code points retained in each candidate preview. */
+  editCandidatePreviewChars?: number
 }
 
 /** Runtime configuration schema for the string-replacement editor tool. */
 export const Config: z<Config> = z.object({
   maxOutputChars: z.number().default(16_000),
   description: z.string().default(DEFAULT_DESCRIPTION),
+  editMatchMode: z.union(['progressive', 'exact']).default('progressive'),
+  editCandidateLimit: z.number().default(3),
+  editCandidateMaxDistance: z.number().default(3),
+  editCandidatePreviewChars: z.number().default(160),
 })
 
 /** Register one `str_replace_editor` tool over `ctx.fs`. */
@@ -512,12 +500,27 @@ export function apply(ctx: Context, config: Config): void {
   const resolved: ResolvedConfig = {
     maxOutputChars: config.maxOutputChars ?? 16_000,
     description: config.description ?? DEFAULT_DESCRIPTION,
+    editMatchOptions: {
+      mode: config.editMatchMode ?? 'progressive',
+      candidateLimit: config.editCandidateLimit ?? 3,
+      candidateMaxDistance: config.editCandidateMaxDistance ?? 3,
+      candidatePreviewChars: config.editCandidatePreviewChars ?? 160,
+    },
   }
   if (!Number.isSafeInteger(resolved.maxOutputChars) || resolved.maxOutputChars <= 0) {
     throw new Error('tool-str-replace-editor: maxOutputChars must be a positive safe integer')
   }
   if (resolved.description.trim().length === 0) {
     throw new Error('tool-str-replace-editor: description must be non-empty')
+  }
+  if (!Number.isSafeInteger(resolved.editMatchOptions.candidateLimit) || resolved.editMatchOptions.candidateLimit < 0) {
+    throw new Error('tool-str-replace-editor: editCandidateLimit must be a non-negative safe integer')
+  }
+  if (!Number.isSafeInteger(resolved.editMatchOptions.candidateMaxDistance) || resolved.editMatchOptions.candidateMaxDistance < 0) {
+    throw new Error('tool-str-replace-editor: editCandidateMaxDistance must be a non-negative safe integer')
+  }
+  if (!Number.isSafeInteger(resolved.editMatchOptions.candidatePreviewChars) || resolved.editMatchOptions.candidatePreviewChars <= 0) {
+    throw new Error('tool-str-replace-editor: editCandidatePreviewChars must be a positive safe integer')
   }
   registerStrReplaceEditor(ctx, resolved)
 }

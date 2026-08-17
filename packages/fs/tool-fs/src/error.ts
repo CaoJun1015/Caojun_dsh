@@ -30,5 +30,32 @@ export function remediateFsError(error: unknown): unknown {
   if (!(error instanceof FsError)) return error
   const remedy = REMEDIES[error.code]
   if (!remedy) return error
-  return new FsError(`${error.message} — ${remedy}`, error.code, { cause: error })
+  return new FsError(`${error.message} — ${remedy}`, error.code, {
+    cause: error,
+    ...error.details === undefined ? {} : { details: error.details },
+  })
+}
+
+/**
+ * Render structured edit diagnostics without making approximate candidates authoritative.
+ * @param error - provider failure to inspect.
+ * @param parameterName - model-facing search parameter name owned by the calling tool.
+ * @returns an edit failure with bounded diagnostics, or the input unchanged.
+ */
+export function formatEditFsError(error: unknown, parameterName: 'old_string' | 'old_str'): unknown {
+  if (!(error instanceof FsError) || error.details === undefined) return error
+  const attempted = error.details.attemptedStrategies.join(', ')
+  const candidates = error.details.candidates.length === 0
+    ? '  - No candidate within the configured edit-distance threshold.'
+    : error.details.candidates
+      .map(candidate => `  - line ${candidate.line}, distance ${candidate.distance}: ${JSON.stringify(candidate.preview)}`)
+      .join('\n')
+  const message = [
+    error.message.replaceAll('old_string', parameterName),
+    `  - Attempted strategies: ${attempted}`,
+    `  - Closest candidate${error.details.candidates.length === 1 ? '' : 's'}:`,
+    candidates,
+    '  - Hint: read the file to confirm its current contents, then retry with a unique literal selection.',
+  ].join('\n')
+  return new FsError(message, error.code, { cause: error, details: error.details })
 }

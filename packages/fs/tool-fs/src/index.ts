@@ -31,6 +31,14 @@ export interface Config {
   readMaxBytes?: number
   /** Files at or above this size stream instead of loading whole into memory. */
   readStreamMinSize?: number
+  /** Literal edit matching policy. Defaults to safe progressive matching. */
+  editMatchMode?: 'progressive' | 'exact'
+  /** Maximum nearby candidates returned after an edit miss. */
+  editCandidateLimit?: number
+  /** Maximum Unicode-code-point edit distance for nearby candidates. */
+  editCandidateMaxDistance?: number
+  /** Maximum Unicode code points shown in each nearby-candidate preview. */
+  editCandidatePreviewChars?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -38,6 +46,10 @@ export const Config: z<Config> = z.object({
   readMaxLineLength: z.number().default(READ_MAX_LINE_LENGTH),
   readMaxBytes: z.number().default(READ_MAX_BYTES),
   readStreamMinSize: z.number().default(STREAM_MIN_SIZE),
+  editMatchMode: z.union(['progressive', 'exact']).default('progressive'),
+  editCandidateLimit: z.number().default(3),
+  editCandidateMaxDistance: z.number().default(3),
+  editCandidatePreviewChars: z.number().default(160),
 })
 
 /** The shape after schemastery applied the defaults. */
@@ -58,6 +70,13 @@ export function apply(ctx: Context, config: Config): void {
   assertPositiveInteger('readMaxLineLength', resolved.readMaxLineLength)
   assertPositiveInteger('readMaxBytes', resolved.readMaxBytes)
   assertPositiveInteger('readStreamMinSize', resolved.readStreamMinSize)
+  if (!Number.isSafeInteger(resolved.editCandidateLimit) || resolved.editCandidateLimit < 0) {
+    throw new Error('tool-fs: editCandidateLimit must be a non-negative safe integer')
+  }
+  if (!Number.isSafeInteger(resolved.editCandidateMaxDistance) || resolved.editCandidateMaxDistance < 0) {
+    throw new Error('tool-fs: editCandidateMaxDistance must be a non-negative safe integer')
+  }
+  assertPositiveInteger('editCandidatePreviewChars', resolved.editCandidatePreviewChars)
   applyReadTool(ctx, {
     limit: resolved.readLimit,
     maxLineLength: resolved.readMaxLineLength,
@@ -75,5 +94,10 @@ export function apply(ctx: Context, config: Config): void {
   // the mounted ctx.fs confines (ctx.fs.sandboxMode).
   const sandbox = new FsSandboxController(ctx)
   applyWriteTool(ctx, sandbox)
-  applyEditTool(ctx, sandbox)
+  applyEditTool(ctx, sandbox, {
+    mode: resolved.editMatchMode,
+    candidateLimit: resolved.editCandidateLimit,
+    candidateMaxDistance: resolved.editCandidateMaxDistance,
+    candidatePreviewChars: resolved.editCandidatePreviewChars,
+  })
 }

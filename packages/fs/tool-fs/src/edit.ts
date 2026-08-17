@@ -9,9 +9,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
+import type { FsEditMatchOptions, FsEditMatchStrategy } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
-import { remediateFsError } from './error.ts'
+import { formatEditFsError, remediateFsError } from './error.ts'
 import { sessionResolveOptions } from './session-cwd.ts'
 import type { FsSandboxController } from './sandbox.ts'
 
@@ -62,10 +63,13 @@ export function parseEditArgs(args: { file_path: string; old_string: string; new
  * @param replaceAll - selects the all-occurrences wording over the single-replacement one.
  * @returns the confirmation sentence the model sees as the tool result.
  */
-export function formatEditOutput(displayPath: string, replaceAll: boolean): string {
-  return replaceAll
+export function formatEditOutput(displayPath: string, replaceAll: boolean, strategy: FsEditMatchStrategy = 'exact'): string {
+  const confirmation = replaceAll
     ? `The file ${displayPath} has been updated. All occurrences were successfully replaced.`
     : `The file ${displayPath} has been updated successfully.`
+  return strategy === 'exact'
+    ? confirmation
+    : `${confirmation} Warning: the edit used the ${strategy} fallback matching strategy.`
 }
 
 /**
@@ -73,11 +77,11 @@ export function formatEditOutput(displayPath: string, replaceAll: boolean): stri
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
  */
-export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void {
+export function applyEditTool(ctx: Context, sandbox: FsSandboxController, matchOptions: FsEditMatchOptions): void {
   ctx.systemPrompt.section({
     name: 'tool:edit',
     order: 102,
-    text: 'Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+    text: 'Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
   })
 
   ctx.tools.register(defineTool({
@@ -85,7 +89,7 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
     description: 'Edit an existing UTF-8 text file by replacing literal text.',
     parameters: {
       file_path: { type: 'string', required: true, description: 'Path to edit, resolved by the filesystem backend.' },
-      old_string: { type: 'string', required: true, description: 'Literal text to replace. Must match exactly.' },
+      old_string: { type: 'string', required: true, description: 'Literal text to replace. It must identify a unique match after the configured safe matching strategies.' },
       new_string: { type: 'string', required: true, description: 'Literal replacement text. Use an empty string to delete the match.' },
       replace_all: { type: 'boolean', description: 'Replace all matches. Defaults to false; when false, old_string must appear exactly once.' },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
@@ -98,11 +102,12 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
           path: { type: 'string', required: true },
           before: { type: 'string', required: true },
           after: { type: 'string', required: true },
+          match_strategy: { type: 'string', required: true },
         },
       },
       render: (args, value) => [{
         type: 'text',
-        text: formatEditOutput(value.path, args.replace_all ?? false),
+        text: formatEditOutput(value.path, args.replace_all ?? false, value.match_strategy as FsEditMatchStrategy),
       }],
       presentationMeta: (args, value) => ({
         diffs: computeHunkDiffs(args.file_path, value.before, value.after)
@@ -126,7 +131,12 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
         const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
         outcome = await ctx.fs.editText(
           target,
-          { oldString: input.oldString, newString: input.newString, replaceAll: input.replaceAll },
+          {
+            oldString: input.oldString,
+            newString: input.newString,
+            replaceAll: input.replaceAll,
+            matchOptions,
+          },
           intent,
           exec.signal,
           sandboxPolicy,
@@ -135,7 +145,7 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
         // recognizes it from bash); stale/not-observed failures gain their
         // model-facing remedy; anything else passes through.
-        throw remediateFsError(sandbox.mapError(error, sandboxPolicy))
+        throw formatEditFsError(remediateFsError(sandbox.mapError(error, sandboxPolicy)), 'old_string')
       }
       // Record the present observation (a no-op when no policy plugin listens).
       ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
@@ -143,6 +153,7 @@ export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void 
         path: target.displayPath,
         before: outcome.before,
         after: outcome.after,
+        match_strategy: outcome.matchStrategy,
       }
     },
     // Pure display: a diff card of the literal replacement (old_string → new_string), derived

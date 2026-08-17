@@ -345,7 +345,8 @@ describe('tool-str-replace-editor', () => {
       new_str: 'x',
     })
     expect(missing.isError).toBe(true)
-    expect(text(missing)).toContain(`old_str \`absent\` did not appear verbatim in ${ambiguous}`)
+    expect(text(missing)).toContain(`old_str was not found in "${ambiguous}"`)
+    expect(text(missing)).toContain('Attempted strategies: exact, trimmed, lineTrailingWhitespace, fullWidthAscii')
     expect(text(missing)).not.toContain('old_string')
 
     const repeated = await call(ctx, owner, {
@@ -355,8 +356,9 @@ describe('tool-str-replace-editor', () => {
       new_str: 'x',
     })
     expect(repeated.isError).toBe(true)
-    expect(text(repeated)).toContain('Multiple occurrences of old_str `same` in lines [1, 3]')
-    expect(text(repeated)).not.toContain('replace_all')
+    expect(text(repeated)).toContain(`old_str matched 2 times in "${ambiguous}"`)
+    expect(text(repeated)).toContain('line 1, distance 0: "same"')
+    expect(text(repeated)).toContain('line 3, distance 0: "same"')
 
     await writeFile(ambiguous, 'alpha\nbeta\nmiddle\nalpha\nbeta')
     const repeatedMultiline = await call(ctx, owner, {
@@ -365,18 +367,21 @@ describe('tool-str-replace-editor', () => {
       old_str: 'alpha\nbeta',
       new_str: 'x',
     })
-    expect(text(repeatedMultiline))
-      .toContain('Multiple occurrences of old_str `alpha\nbeta` in lines [1, 4]')
+    expect(text(repeatedMultiline)).toContain(`old_str matched 2 times in "${ambiguous}"`)
+    expect(text(repeatedMultiline)).toContain('line 1, distance 0: "alpha\\nbeta"')
+    expect(text(repeatedMultiline)).toContain('line 4, distance 0: "alpha\\nbeta"')
 
     const mixedEol = join(root, 'mixed-eol.txt')
     await writeFile(mixedEol, 'alpha\r\nbeta\nmiddle\nalpha\nbeta')
-    expect((await call(ctx, owner, {
+    const mixedResult = await call(ctx, owner, {
       command: 'str_replace',
       path: mixedEol,
       old_str: 'alpha\r\nbeta',
       new_str: 'replaced',
-    })).isError).toBe(false)
-    expect(await readFile(mixedEol, 'utf8')).toBe('replaced\nmiddle\nalpha\nbeta')
+    })
+    expect(mixedResult.isError).toBe(true)
+    expect(text(mixedResult)).toContain('old_str matched 2 times')
+    expect(await readFile(mixedEol, 'utf8')).toBe('alpha\r\nbeta\nmiddle\nalpha\nbeta')
 
     const relative = await call(ctx, owner, { command: 'view', path: 'ambiguous.txt' })
     expect(relative.isError).toBe(true)
@@ -428,7 +433,7 @@ describe('tool-str-replace-editor', () => {
     expect(special.error).toMatchObject({ info: { code: 'FS_NOT_REGULAR_FILE' } })
     expect((await call(ctx, owner, {
       command: 'str_replace',
-      path: join(root, 'special'),
+      path: directory,
       old_str: 'x',
       new_str: 'y',
     })).error).toMatchObject({ info: { code: 'FS_NOT_REGULAR_FILE' } })
@@ -548,6 +553,7 @@ describe('tool-str-replace-editor', () => {
       throw new Error('backend write failed')
     }
     ctx.fs.writeText = failWrite
+    ctx.fs.editText = failWrite
 
     const replace = await call(ctx, owner, {
       command: 'str_replace',
