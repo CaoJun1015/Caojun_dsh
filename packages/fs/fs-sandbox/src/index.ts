@@ -10,22 +10,18 @@
  * The fence is a policy check in TRUSTED code over a MODEL-CONTROLLED path,
  * NOT a kernel boundary — the operations are the seam's own (open, rename),
  * and only the target path is untrusted, so canonicalize-then-contain is the
- * complete answer to this surface. Kernel-grade isolation of untrusted CODE
- * stays `ctx.shell`'s job (`@deepseek-ai/dsh-bash-sandbox`). This mirrors the
- * `code-runtime` stance: containment, not a security boundary. The residual
+ * complete answer to this surface. This is containment, not a security
+ * boundary; kernel-grade isolation of untrusted CODE stays `ctx.shell`'s job
+ * (`@deepseek-ai/dsh-bash-sandbox`). The residual
  * TOCTOU (an ancestor symlink swapped between the containment re-check and the
  * syscall) is narrowed by re-canonicalizing immediately before delegating and
  * is accepted for this threat model.
  *
  * Per-call policy: `read-only` denies every mutation; `workspace-write` allows
  * a mutation only when the target canonicalizes under the policy's workspace
- * root or a platform temp area (the SAME writable-root set Seatbelt grants,
- * derived from the one `writableRoots` function so bash and fs cannot drift);
+ * root or a platform temp area from the shared `writableRoots` policy;
  * `danger-full-access` delegates unfenced. A denial throws the structured
- * `FS_SANDBOX_DENIED` — no text inference is needed (unlike bash's kernel
- * stderr), because an in-process fence knows exactly what it refused. The
- * escalation retry lives in the tool layer (`@deepseek-ai/dsh-tool-fs`),
- * exactly as bash's does.
+ * `FS_SANDBOX_DENIED`.
  *
  * @module @deepseek-ai/dsh-fs-sandbox
  */
@@ -34,7 +30,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import type { Config as LocalConfig } from '@deepseek-ai/dsh-fs-local'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditOptions, FsEditOutcome, FsEditRequest, FsTarget, FsWriteOptions, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -75,19 +71,20 @@ export class SandboxedFileSystem extends LocalFileSystem {
    * atomic write. See {@link checkedTarget}.
    * @param target - the resolved target to write.
    * @param content - the full new file content.
-   * @param options - intent, backup policy, cancellation, and per-call sandbox policy.
+   * @param expected - the write intent guarding the write; omit for unconditional.
+   * @param signal - aborts before atomic publication takes effect.
+   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
+   *   the deployment fallback.
    * @returns the write outcome from the inherited backend.
    */
   override async writeText(
     target: FsTarget,
     content: string,
-    options: FsWriteOptions,
+    expected?: FsWriteIntent,
+    signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome> {
-    return super.writeText(
-      await this.checkedTarget(target, options.sandboxPolicy),
-      content,
-      options,
-    )
+    return super.writeText(await this.checkedTarget(target, sandboxPolicy), content, expected, signal)
   }
 
   /**
@@ -95,19 +92,20 @@ export class SandboxedFileSystem extends LocalFileSystem {
    * atomic edit. See {@link checkedTarget}.
    * @param target - the resolved target to edit.
    * @param edit - the literal search/replace request.
-   * @param options - version guard, backup policy, cancellation, and per-call sandbox policy.
+   * @param expected - the version guard; omit for an unconditional edit.
+   * @param signal - aborts before atomic publication takes effect.
+   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
+   *   the deployment fallback.
    * @returns the edit outcome from the inherited backend.
    */
   override async editText(
     target: FsTarget,
     edit: FsEditRequest,
-    options: FsEditOptions,
+    expected?: { version: FsVersion },
+    signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
-    return super.editText(
-      await this.checkedTarget(target, options.sandboxPolicy),
-      edit,
-      options,
-    )
+    return super.editText(await this.checkedTarget(target, sandboxPolicy), edit, expected, signal)
   }
 
   /**

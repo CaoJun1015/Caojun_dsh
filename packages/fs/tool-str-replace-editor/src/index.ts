@@ -6,8 +6,9 @@
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { FsError, resolveFsText } from '@deepseek-ai/dsh-fs'
-import type { FsEditMatchOptions, FsInfo, FsTarget, FsTextFormat, FsWriteIntent } from '@deepseek-ai/dsh-fs'
+import { FsError } from '@deepseek-ai/dsh-fs'
+import type { FsInfo, FsTarget, FsWriteIntent } from '@deepseek-ai/dsh-fs'
+import { truncateWithoutSplittingSurrogatePair } from '@deepseek-ai/dsh-output-retention'
 import { sandboxDenialMarker } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
@@ -22,10 +23,10 @@ Custom editing tool for viewing, creating and editing files
 * If \`path\` is a file, \`view\` displays the result of applying \`cat -n\`. If \`path\` is a directory, \`view\` lists non-hidden files and directories up to 2 levels deep
 * The \`create\` command cannot be used if the specified \`path\` already exists as a file
 * If a \`command\` generates a long output, it will be truncated and marked with \`<response clipped>\`
-* Text format parameters default to \`text\`: use the JSON-decoded string unchanged. JSON \`"\\n"\` is a newline, while \`"\\\\n"\` is a literal backslash plus n. Choose \`escaped\` only to decode one additional strict layer
+* A null placeholder for a parameter unused by the selected command is treated as omitted. Required parameters still need values; omit \`str_replace.new_str\` rather than setting it to null when deleting a match
 
 Notes for using the \`str_replace\` command:
-* The \`old_str\` parameter must identify one unique region. Progressive matching can ignore outer search whitespace, per-line trailing whitespace, and full-width ASCII differences; approximate candidates are suggestions only
+* The \`old_str\` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
 * If the \`old_str\` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in \`old_str\` to make it unique
 * The \`new_str\` parameter should contain the edited lines that should replace the \`old_str\`
 `.trim()
@@ -33,27 +34,34 @@ Notes for using the \`str_replace\` command:
 function maybeTruncate(content: string, maxOutputChars: number): string {
   return content.length <= maxOutputChars
     ? content
-    : content.slice(0, maxOutputChars) + TRUNCATED_MESSAGE
+    : truncateWithoutSplittingSurrogatePair(content, maxOutputChars) + TRUNCATED_MESSAGE
 }
 
 function codepointCompare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-function formatEditFsError(error: unknown): unknown {
-  if (!(error instanceof FsError) || error.details === undefined) return error
-  const candidates = error.details.candidates.length === 0
-    ? '  - No candidate within the configured edit-distance threshold.'
-    : error.details.candidates
-      .map(candidate => `  - line ${candidate.line}, distance ${candidate.distance}: ${JSON.stringify(candidate.preview)}`)
-      .join('\n')
-  return new FsError([
-    error.message.replaceAll('old_string', 'old_str'),
-    `  - Attempted strategies: ${error.details.attemptedStrategies.join(', ')}`,
-    `  - Closest candidate${error.details.candidates.length === 1 ? '' : 's'}:`,
-    candidates,
-    '  - Hint: view the file to confirm its current contents, then retry with a unique literal selection.',
-  ].join('\n'), error.code, { cause: error, details: error.details })
+function matchOffsets(content: string, search: string): number[] {
+  const offsets: number[] = []
+  let offset = 0
+  while (true) {
+    const match = content.indexOf(search, offset)
+    if (match < 0) return offsets
+    offsets.push(match)
+    offset = match + search.length
+  }
+}
+
+function lineNumbersAt(content: string, offsets: readonly number[]): number[] {
+  let line = 1
+  let cursor = 0
+  return offsets.map((offset) => {
+    while (cursor < offset) {
+      if (content[cursor] === '\n') line += 1
+      cursor += 1
+    }
+    return line
+  })
 }
 
 class MutationPolicy {
@@ -235,15 +243,9 @@ async function createFile(
   policy: MutationPolicy,
   path: string,
   fileText: string | undefined,
-  fileTextFormat: FsTextFormat | undefined,
-  backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
-  const content = resolveFsText(
-    requiredForCommand(fileText, 'file_text', 'create'),
-    fileTextFormat ?? 'text',
-    'file_text',
-  )
+  const content = requiredForCommand(fileText, 'file_text', 'create')
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   if (await ctx.fs.stat(target, exec.signal) !== undefined) {
@@ -260,12 +262,9 @@ async function createFile(
     outcome = await ctx.fs.writeText(
       target,
       content,
-      {
-        ...intent === undefined ? {} : { intent },
-        backup: backupBeforeMutation ? 'required' : 'disabled',
-        signal: exec.signal,
-        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
-      },
+      intent,
+      exec.signal,
+      sandboxPolicy,
     )
   } catch (error: unknown) {
     throw policy.mapError(error, sandboxPolicy)
@@ -279,43 +278,53 @@ async function replaceInFile(
   policy: MutationPolicy,
   path: string,
   oldStr: string | undefined,
-  newStr: string | undefined,
-  oldStrFormat: FsTextFormat | undefined,
-  newStrFormat: FsTextFormat | undefined,
-  matchOptions: FsEditMatchOptions,
-  backupBeforeMutation: boolean,
+  newStr: string | null | undefined,
   exec: ToolRunContext,
 ): Promise<string> {
+  if (newStr === null) {
+    throw new Error('Parameter `new_str` must be omitted or contain a string for command: str_replace')
+  }
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
-  const oldValue = resolveFsText(
-    requiredForCommand(oldStr, 'old_str', 'str_replace', false),
-    oldStrFormat ?? 'text',
-    'old_str',
-  )
-  if (oldValue.length === 0) throw new Error('Parameter `old_str` is empty for command: str_replace')
-  const newValue = newStr === undefined ? '' : resolveFsText(newStr, newStrFormat ?? 'text', 'new_str')
+  const oldValue = requiredForCommand(oldStr, 'old_str', 'str_replace', false)
+  const newValue = newStr ?? ''
+  const info = await statExisting(ctx, target, 'str_replace', exec)
+  if (info.type !== 'file') {
+    throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+  }
+  const before = await ctx.fs.readText(target, exec.signal)
+  const offsets = matchOffsets(before, oldValue)
+  const offset = offsets[0]
+  if (offset === undefined) {
+    throw new FsError(
+      `No replacement was performed, old_str \`${oldValue}\` did not appear verbatim in ${target.displayPath}.`,
+      'FS_EDIT_NOT_FOUND',
+    )
+  }
+  if (offsets.length > 1) {
+    const lines = lineNumbersAt(before, offsets)
+    throw new FsError(
+      `No replacement was performed. Multiple occurrences of old_str \`${oldValue}\` in lines [${lines.join(', ')}]. Please ensure it is unique`,
+      'FS_AMBIGUOUS_EDIT',
+    )
+  }
   let outcome
   try {
-    outcome = await ctx.fs.editText(
+    outcome = await ctx.fs.writeText(
       target,
-      { oldString: oldValue, newString: newValue, replaceAll: false, matchOptions },
-      {
-        ...intent === undefined ? {} : { version: intent.version },
-        backup: backupBeforeMutation ? 'required' : 'disabled',
-        signal: exec.signal,
-        ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
-      },
+      before.slice(0, offset) + newValue + before.slice(offset + oldValue.length),
+      intent === undefined
+        ? { kind: 'replaceIfVersion', version: info.version }
+        : { kind: 'replaceIfVersion', version: intent.version },
+      exec.signal,
+      sandboxPolicy,
     )
   } catch (error: unknown) {
-    throw formatEditFsError(policy.mapError(error, sandboxPolicy))
+    throw policy.mapError(error, sandboxPolicy)
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-  const backup = outcome.backup === null ? '' : ` Backup: ${outcome.backup.path} (${outcome.backup.bytes} bytes).`
-  return outcome.matchStrategy === 'exact'
-    ? `The file ${target.displayPath} has been edited successfully.${backup}`
-    : `The file ${target.displayPath} has been edited successfully.${backup} Warning: the edit used the ${outcome.matchStrategy} fallback matching strategy.`
+  return `The file ${target.displayPath} has been edited successfully.`
 }
 
 async function insertInFile(
@@ -324,16 +333,10 @@ async function insertInFile(
   path: string,
   insertLine: number | undefined,
   newStr: string | undefined,
-  newStrFormat: FsTextFormat | undefined,
-  backupBeforeMutation: boolean,
   exec: ToolRunContext,
 ): Promise<string> {
   if (insertLine === undefined) throw new Error('Parameter `insert_line` is required for command: insert')
-  const value = resolveFsText(
-    requiredForCommand(newStr, 'new_str', 'insert'),
-    newStrFormat ?? 'text',
-    'new_str',
-  )
+  const value = requiredForCommand(newStr, 'new_str', 'insert')
   const sandboxPolicy = policy.resolve(exec)
   const target = await resolveTarget(ctx, path, exec.signal)
   const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
@@ -358,37 +361,26 @@ async function insertInFile(
     : { kind: 'replaceIfVersion', version: intent.version }
   let outcome
   try {
-    outcome = await ctx.fs.writeText(target, after, {
-      intent: expected,
-      backup: backupBeforeMutation ? 'required' : 'disabled',
-      signal: exec.signal,
-      ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
-    })
+    outcome = await ctx.fs.writeText(target, after, expected, exec.signal, sandboxPolicy)
   } catch (error: unknown) {
     throw policy.mapError(error, sandboxPolicy)
   }
   ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-  const backup = outcome.backup === null ? '' : ` Backup: ${outcome.backup.path} (${outcome.backup.bytes} bytes).`
-  return `The file ${target.displayPath} has been edited successfully.${backup}`
+  return `The file ${target.displayPath} has been edited successfully.`
 }
 
 interface ResolvedConfig {
   maxOutputChars: number
   description: string
-  editMatchOptions: FsEditMatchOptions
-  backupBeforeMutation: boolean
 }
 
 function presentEditorCall(args: {
   command: 'view' | 'create' | 'str_replace' | 'insert'
   path: string
-  file_text?: string
-  file_text_format?: FsTextFormat
-  insert_line?: number
-  new_str?: string
-  new_str_format?: FsTextFormat
-  old_str?: string
-  old_str_format?: FsTextFormat
+  file_text?: string | null
+  insert_line?: number | null
+  new_str?: string | null
+  old_str?: string | null
 }): ToolCallView {
   switch (args.command) {
     case 'view':
@@ -398,35 +390,24 @@ function presentEditorCall(args: {
         kind: 'read',
         locations: [{ path: args.path }],
       }
-    case 'create': {
-      const fileText = args.file_text === undefined
-        ? ''
-        : resolveFsText(args.file_text, args.file_text_format ?? 'text', 'file_text')
+    case 'create':
       return {
         card: 'diff',
         title: `create ${args.path}`,
-        diffs: [{ path: args.path, oldText: null, newText: fileText }],
+        diffs: [{ path: args.path, oldText: null, newText: args.file_text ?? '' }],
         locations: [{ path: args.path }],
       }
-    }
-    case 'str_replace': {
-      const oldText = args.old_str === undefined
-        ? null
-        : resolveFsText(args.old_str, args.old_str_format ?? 'text', 'old_str')
-      const newText = args.new_str === undefined
-        ? ''
-        : resolveFsText(args.new_str, args.new_str_format ?? 'text', 'new_str')
+    case 'str_replace':
       return {
         card: 'diff',
         title: `str_replace ${args.path}`,
         diffs: [{
           path: args.path,
-          oldText,
-          newText,
+          oldText: args.old_str ?? null,
+          newText: args.new_str ?? '',
         }],
         locations: [{ path: args.path }],
       }
-    }
     case 'insert':
       return {
         card: 'generic',
@@ -434,7 +415,9 @@ function presentEditorCall(args: {
         kind: 'edit',
         locations: [{
           path: args.path,
-          ...args.insert_line === undefined ? {} : { line: Math.max(1, args.insert_line + 1) },
+          ...args.insert_line === undefined || args.insert_line === null
+            ? {}
+            : { line: Math.max(1, args.insert_line + 1) },
         }],
       }
   }
@@ -459,40 +442,27 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
         description: 'Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.',
       },
       file_text: {
-        type: 'string',
-        description: 'Required parameter of `create` command, with the content of the file to be created.',
-      },
-      file_text_format: {
-        type: 'string',
-        enum: ['text', 'escaped'],
-        description: 'file_text transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Required string parameter of `create` command, with the content of the file to be created. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       insert_line: {
-        type: 'integer',
-        description: 'Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.',
+        oneOf: [{ type: 'integer' }, { type: 'null' }],
+        description: 'Required integer parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       new_str: {
-        type: 'string',
-        description: 'Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.',
-      },
-      new_str_format: {
-        type: 'string',
-        enum: ['text', 'escaped'],
-        description: 'new_str transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Optional string parameter of `str_replace` command containing the new string (if omitted, no string will be added). Required string parameter of `insert` command containing the string to insert. A null placeholder is accepted only by commands that do not use this parameter.',
       },
       old_str: {
-        type: 'string',
-        description: 'Required parameter of `str_replace` command containing the string in `path` to replace.',
-      },
-      old_str_format: {
-        type: 'string',
-        enum: ['text', 'escaped'],
-        description: 'old_str transport. Defaults to text; escaped decodes exactly one strict escape layer.',
+        oneOf: [{ type: 'string' }, { type: 'null' }],
+        description: 'Required string parameter of `str_replace` command containing the string in `path` to replace. A null placeholder is treated as omitted by commands that do not use this parameter.',
       },
       view_range: {
-        type: 'array',
-        items: { type: 'integer' },
-        description: 'Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.',
+        oneOf: [
+          { type: 'array', items: { type: 'integer' } },
+          { type: 'null' },
+        ],
+        description: 'Optional parameter of `view` command when `path` points to a file. If omitted or null, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.',
       },
     },
     output: {
@@ -502,23 +472,16 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
     async execute(args, exec) {
       switch (args.command) {
         case 'view':
-          return viewPath(ctx, args.path, args.view_range, config.maxOutputChars, exec)
+          return viewPath(ctx, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
         case 'create':
-          return createFile(
-            ctx, policy, args.path, args.file_text, args.file_text_format,
-            config.backupBeforeMutation, exec,
-          )
+          return createFile(ctx, policy, args.path, args.file_text ?? undefined, exec)
         case 'str_replace':
           return replaceInFile(
             ctx,
             policy,
             args.path,
-            args.old_str,
+            args.old_str ?? undefined,
             args.new_str,
-            args.old_str_format,
-            args.new_str_format,
-            config.editMatchOptions,
-            config.backupBeforeMutation,
             exec,
           )
         case 'insert':
@@ -526,10 +489,8 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
             ctx,
             policy,
             args.path,
-            args.insert_line,
-            args.new_str,
-            args.new_str_format,
-            config.backupBeforeMutation,
+            args.insert_line ?? undefined,
+            args.new_str ?? undefined,
             exec,
           )
       }
@@ -547,27 +508,12 @@ export interface Config {
   maxOutputChars?: number
   /** Model-facing tool description. */
   description?: string
-  /** Literal edit matching policy. Defaults to safe progressive matching. */
-  editMatchMode?: 'progressive' | 'exact'
-  /** Maximum nearby candidates returned after an edit miss. */
-  editCandidateLimit?: number
-  /** Maximum Unicode-code-point edit distance for nearby candidates. */
-  editCandidateMaxDistance?: number
-  /** Maximum Unicode code points retained in each candidate preview. */
-  editCandidatePreviewChars?: number
-  /** Require provider backup before replacing an existing file. Defaults to true. */
-  backupBeforeMutation?: boolean
 }
 
 /** Runtime configuration schema for the string-replacement editor tool. */
 export const Config: z<Config> = z.object({
   maxOutputChars: z.number().default(16_000),
   description: z.string().default(DEFAULT_DESCRIPTION),
-  editMatchMode: z.union(['progressive', 'exact']).default('progressive'),
-  editCandidateLimit: z.number().default(3),
-  editCandidateMaxDistance: z.number().default(3),
-  editCandidatePreviewChars: z.number().default(160),
-  backupBeforeMutation: z.boolean().default(true),
 })
 
 /** Register one `str_replace_editor` tool over `ctx.fs`. */
@@ -575,28 +521,12 @@ export function apply(ctx: Context, config: Config): void {
   const resolved: ResolvedConfig = {
     maxOutputChars: config.maxOutputChars ?? 16_000,
     description: config.description ?? DEFAULT_DESCRIPTION,
-    editMatchOptions: {
-      mode: config.editMatchMode ?? 'progressive',
-      candidateLimit: config.editCandidateLimit ?? 3,
-      candidateMaxDistance: config.editCandidateMaxDistance ?? 3,
-      candidatePreviewChars: config.editCandidatePreviewChars ?? 160,
-    },
-    backupBeforeMutation: config.backupBeforeMutation ?? true,
   }
   if (!Number.isSafeInteger(resolved.maxOutputChars) || resolved.maxOutputChars <= 0) {
     throw new Error('tool-str-replace-editor: maxOutputChars must be a positive safe integer')
   }
   if (resolved.description.trim().length === 0) {
     throw new Error('tool-str-replace-editor: description must be non-empty')
-  }
-  if (!Number.isSafeInteger(resolved.editMatchOptions.candidateLimit) || resolved.editMatchOptions.candidateLimit < 0) {
-    throw new Error('tool-str-replace-editor: editCandidateLimit must be a non-negative safe integer')
-  }
-  if (!Number.isSafeInteger(resolved.editMatchOptions.candidateMaxDistance) || resolved.editMatchOptions.candidateMaxDistance < 0) {
-    throw new Error('tool-str-replace-editor: editCandidateMaxDistance must be a non-negative safe integer')
-  }
-  if (!Number.isSafeInteger(resolved.editMatchOptions.candidatePreviewChars) || resolved.editMatchOptions.candidatePreviewChars <= 0) {
-    throw new Error('tool-str-replace-editor: editCandidatePreviewChars must be a positive safe integer')
   }
   registerStrReplaceEditor(ctx, resolved)
 }

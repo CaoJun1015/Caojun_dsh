@@ -9,11 +9,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
-import { resolveFsText } from '@deepseek-ai/dsh-fs'
-import type { FsTextFormat } from '@deepseek-ai/dsh-fs'
-import type {} from '@deepseek-ai/dsh-system-prompt'
-import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
+import type {} from '@deepseek-ai/dsh-fs'
+import { computeHunkDiffs, diffsFromMeta, pathFromMeta } from './diff.ts'
 import { remediateFsError } from './error.ts'
+import { mutationResult } from './mutation-result.ts'
 import { sessionResolveOptions } from './session-cwd.ts'
 import type { FsSandboxController } from './sandbox.ts'
 
@@ -23,17 +22,9 @@ import type { FsSandboxController } from './sandbox.ts'
  * @param args - the schema-validated raw tool arguments.
  * @returns the camelCased input; `content` passes through untouched.
  */
-export function parseWriteArgs(args: {
-  file_path: string
-  content: string
-  content_format?: FsTextFormat
-}): { filePath: string; content: string } {
+export function parseWriteArgs(args: { file_path: string; content: string }): { filePath: string; content: string } {
   if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
-  const contentFormat = args.content_format ?? 'text'
-  return {
-    filePath: args.file_path,
-    content: resolveFsText(args.content, contentFormat, 'content'),
-  }
+  return { filePath: args.file_path, content: args.content }
 }
 
 /**
@@ -42,19 +33,13 @@ export function parseWriteArgs(args: {
  * @param outcome - the write outcome; its `operation` selects the Created/Updated wording.
  * @returns the model-facing confirmation envelope (no file content is echoed back).
  */
-export function formatWriteOutput(
-  displayPath: string,
-  outcome: Pick<FsWriteOutcome, 'operation'> & { backup: Pick<NonNullable<FsWriteOutcome['backup']>, 'path' | 'bytes'> | null },
-): string {
+export function formatWriteOutput(displayPath: string, outcome: Pick<FsWriteOutcome, 'operation'>): string {
   const verb = outcome.operation === 'create' ? 'Created' : 'Updated'
-  const recovery = outcome.backup === null
-    ? ''
-    : `\n<backup path="${outcome.backup.path}" bytes="${outcome.backup.bytes}" />`
   return `<path>${displayPath}</path>
 <type>file</type>
 <content>
 ${verb} file
-</content>${recovery}`
+</content>`
 }
 
 /**
@@ -65,35 +50,36 @@ ${verb} file
 interface WriteToolArgs {
   file_path: string
   content: string
-  content_format?: FsTextFormat
   sandbox_permissions?: string
   justification?: string
 }
 
 /**
- * Register the `write` tool and its system-prompt guidance.
+ * Register the `write` tool and its scope-aware system-prompt guidance.
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
- * @param backupBeforeMutation - whether existing files require a provider backup.
  */
-export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backupBeforeMutation: boolean): void {
+export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void {
   ctx.systemPrompt.section({
     name: 'tool:write',
-    order: 101,
-    text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes. content_format defaults to text, which uses the JSON-decoded string unchanged: JSON "\\n" is a newline, while "\\\\n" is a literal backslash plus n. Select escaped only to decode one additional layer of \\\\, \\n, \\r, or \\t.',
+    order: ctx.systemPrompt.getSectionOrder('TOOL_WRITE'),
+    text: ({ scope }) => ctx.tools.get('write', scope) === undefined
+      ? ''
+      : 'Read an existing file before overwriting it with write (the default fs-observation-policy requires it)'
+        + (ctx.tools.get('edit', scope) === undefined ? '' : ' and prefer edit for targeted changes')
+        + '.',
   })
 
   ctx.tools.register(defineTool({
     name: 'write',
     description: 'Create or fully replace a UTF-8 text file.',
     parameters: {
-      file_path: { type: 'string', required: true, description: 'Path to write, resolved by the filesystem backend.' },
-      content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
-      content_format: {
-        type: 'string',
-        enum: ['text', 'escaped'],
-        description: 'Text transport. Defaults to text (use the JSON-decoded string unchanged); escaped decodes exactly one layer of \\\\, \\n, \\r, and \\t.',
+      file_path: {
+        type: 'string', required: true,
+        description: 'Path to write, resolved by the filesystem backend. '
+          + 'Provide `file_path` before `content` in the arguments.',
       },
+      content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
     },
     output: {
@@ -101,7 +87,7 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
         type: 'object',
         additionalProperties: false,
         properties: {
-          path: { type: 'string', required: true },
+          path: { type: 'string', required: true, description: 'Canonical absolute path in the filesystem execution world.' },
           operation: { type: 'string', required: true, enum: ['create', 'update'] },
           before: {
             required: true,
@@ -111,27 +97,15 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
             ],
           },
           after: { type: 'string', required: true },
-          backup: {
-            required: true,
-            oneOf: [
-              { type: 'null' },
-              {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  path: { type: 'string', required: true },
-                  bytes: { type: 'integer', required: true },
-                },
-              },
-            ],
-          },
         },
       },
       render: (_args, value) => [{ type: 'text', text: formatWriteOutput(value.path, value) }],
-      presentationMeta: (args, value) => ({
+      presentationMeta: (_args, value) => ({
+        operation: value.operation,
+        path: value.path,
         diffs: value.before === null
           ? []
-          : computeHunkDiffs(args.file_path, value.before, value.after)
+          : computeHunkDiffs(value.path, value.before, value.after)
             .map(({ path, oldText, newText }) => ({ path, oldText, newText })),
       }),
     },
@@ -141,44 +115,28 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
       // > backend default, plus the session cwd root) BEFORE anything executes;
       // an escalating call throws its distinct text on any non-grant.
       const sandboxPolicy = await sandbox.resolvePolicy('write', args, exec)
-      const target = await ctx.fs.resolve(input.filePath, sessionResolveOptions(exec, input.filePath, sandboxPolicy?.workspaceRoot))
+      const target = await ctx.fs.resolve(input.filePath, await sessionResolveOptions(ctx, exec))
       // Single-slot decision: the policy plugin produces createIfAbsent/
       // replaceIfVersion; the bare default is undefined (unconditional). No stat.
       const intent = await ctx.waterfall('fs/write-intent', target, exec, () => undefined)
       let outcome: FsWriteOutcome
       try {
-        outcome = await ctx.fs.writeText(target, input.content, {
-          ...intent === undefined ? {} : { intent },
-          backup: backupBeforeMutation ? 'required' : 'disabled',
-          signal: exec.signal,
-          ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
-        })
+        outcome = await ctx.fs.writeText(target, input.content, intent, exec.signal, sandboxPolicy)
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
-        // recognizes it from bash); stale/not-observed failures gain their
-        // model-facing remedy; anything else passes through.
-        throw remediateFsError(sandbox.mapError(error, sandboxPolicy))
+        // recognizes it from bash); guarded mutation failures receive their
+        // stable model-facing diagnostic; anything else passes through.
+        throw remediateFsError(sandbox.mapError(error, sandboxPolicy), target.displayPath)
       }
-      // Record the present observation (a no-op when no policy plugin listens).
-      ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-      return {
-        path: target.displayPath,
-        operation: outcome.operation,
-        before: outcome.before,
-        after: outcome.after,
-        backup: outcome.backup === null
-          ? null
-          : { path: outcome.backup.path, bytes: outcome.backup.bytes },
-      }
+      return mutationResult(ctx, target, outcome, exec)
     },
     // Pure display: a diff card. A call-time presenter has no access to prior
     // file content, so `oldText: null` also represents an overwrite here.
     presentCall(args): DiffCallView {
-      const content = resolveFsText(args.content, args.content_format ?? 'text', 'content')
       return {
         card: 'diff',
         title: `Write ${args.file_path}`,
-        diffs: [{ path: args.file_path, oldText: null, newText: content }],
+        diffs: [{ path: args.file_path, oldText: null, newText: args.content }],
         locations: [{ path: args.file_path }],
       }
     },
@@ -188,11 +146,7 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxController, backu
     presentResult(args, result: ToolResult): DiffResultView | undefined {
       if (result.isError) return undefined
       const diffs = diffsFromMeta(result.meta)
-        ?? [{
-          path: args.file_path,
-          oldText: null,
-          newText: resolveFsText(args.content, args.content_format ?? 'text', 'content'),
-        }]
+        ?? [{ path: pathFromMeta(result.meta) ?? args.file_path, oldText: null, newText: args.content }]
       return { card: 'diff', title: `Write ${args.file_path}`, diffs }
     },
   }))

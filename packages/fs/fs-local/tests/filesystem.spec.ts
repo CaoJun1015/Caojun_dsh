@@ -8,60 +8,25 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { constants as bufferConstants } from 'node:buffer'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, parse, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { FsVersion } from '@deepseek-ai/dsh-fs'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
-import type { FsEditOptions, FsEditRequest, FsWriteIntent, FsWriteOptions } from '@deepseek-ai/dsh-fs'
-
-class TestLocalFileSystem extends LocalFileSystem {
-  override writeText(
-    target: FsTarget,
-    content: string,
-    optionsOrIntent?: FsWriteOptions | FsWriteIntent,
-    signal?: AbortSignal,
-  ) {
-    const options: FsWriteOptions = optionsOrIntent !== undefined && 'backup' in optionsOrIntent
-      ? optionsOrIntent
-      : {
-        ...optionsOrIntent === undefined ? {} : { intent: optionsOrIntent },
-        backup: 'disabled',
-        ...signal === undefined ? {} : { signal },
-      }
-    return super.writeText(target, content, options)
-  }
-
-  override editText(
-    target: FsTarget,
-    edit: FsEditRequest,
-    optionsOrVersion?: FsEditOptions | { version: FsVersion },
-    signal?: AbortSignal,
-  ) {
-    const options: FsEditOptions = optionsOrVersion !== undefined && 'backup' in optionsOrVersion
-      ? optionsOrVersion
-      : {
-        ...optionsOrVersion,
-        backup: 'disabled',
-        ...signal === undefined ? {} : { signal },
-      }
-    return super.editText(target, edit, options)
-  }
-}
 
 let dir: string
 let ctx: Context
-let fs: TestLocalFileSystem
+let fs: LocalFileSystem
 let fiber: Awaited<ReturnType<Context['plugin']>>
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'dsh-fs-'))
   ctx = new Context()
-  fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, backupRoot: join(dir, '.backups') })
-  fs = ctx.fs as TestLocalFileSystem
+  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir })
+  fs = ctx.fs as LocalFileSystem
 })
 afterEach(async () => {
   await fiber.dispose()
@@ -81,8 +46,8 @@ async function versionOf(target: FsTarget): Promise<FsVersion> {
 
 async function remountWithDiffLimit(diffBasisMaxBytes: number): Promise<void> {
   await fiber.dispose()
-  fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, diffBasisMaxBytes, backupRoot: join(dir, '.backups') })
-  fs = ctx.fs as TestLocalFileSystem
+  fiber = await ctx.plugin(LocalFileSystem, { cwd: dir, diffBasisMaxBytes })
+  fs = ctx.fs as LocalFileSystem
 }
 
 describe('registration', () => {
@@ -92,6 +57,12 @@ describe('registration', () => {
     expect((bare.fs as LocalFileSystem).config.cwd).toBe(process.cwd())
     expect((bare.fs as LocalFileSystem).config.diffBasisMaxBytes).toBe(10 * 1024 * 1024)
     await bareFiber.dispose()
+  })
+
+  it('maps only absolute host paths into its process path namespace', () => {
+    const path = join(dir, 'image.png')
+    expect(fs.processPathFromHostPath(path)).toBe(path)
+    expect(fs.processPathFromHostPath('image.png')).toBeUndefined()
   })
 
   it('rejects non-positive, fractional, unsafe, or unallocatable diff-basis limits', async () => {
@@ -196,6 +167,17 @@ describe('stat', () => {
 })
 
 describe('lstat', () => {
+  it.skipIf(process.platform !== 'win32')('uses the same native drive-relative paths as resolve', async () => {
+    await writeFile(join(dir, 'created.txt'), 'native')
+    const drive = parse(dir).root.slice(0, 2)
+    for (const cwd of [dir, `${drive}${relative(process.cwd(), dir)}`]) {
+      for (const path of ['created.txt', `${drive}created.txt`]) {
+        const target = await fs.resolve(path, { cwd })
+        expect(await fs.lstat(path, { cwd })).toEqual(await fs.stat(target))
+      }
+    }
+  })
+
   it('reports path metadata without following the final symlink component', async () => {
     await writeFile(join(dir, 'real.txt'), 'hello')
     await symlink(join(dir, 'real.txt'), join(dir, 'link.txt'))
@@ -334,6 +316,45 @@ describe('readBytes', () => {
     const controller = new AbortController()
     controller.abort()
     await expect(fs.readBytes(await fs.resolve('a.bin'), controller.signal, 1024)).rejects.toMatchObject({ code: 'FS_ABORTED' })
+  })
+})
+
+describe('readByteRange', () => {
+  /** 256 bytes, each equal to its offset. */
+  const ramp = Buffer.from(Array.from({ length: 256 }, (_, i) => i))
+
+  it('reads a window from the middle of a file larger than the window', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    const window = await fs.readByteRange(await fs.resolve('ramp.bin'), { offset: 100, length: 4 }, new AbortController().signal)
+    expect([...window]).toEqual([100, 101, 102, 103])
+  })
+
+  it('shortens a window the file ends inside and empties one at or past the end', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    const target = await fs.resolve('ramp.bin')
+    expect([...await fs.readByteRange(target, { offset: 253, length: 10 })]).toEqual([253, 254, 255])
+    expect((await fs.readByteRange(target, { offset: 256, length: 10 })).length).toBe(0)
+    expect((await fs.readByteRange(target, { offset: 1000, length: 10 })).length).toBe(0)
+  })
+
+  it('returns an empty window for length 0 without touching content', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    expect((await fs.readByteRange(await fs.resolve('ramp.bin'), { offset: 0, length: 0 })).length).toBe(0)
+  })
+
+  it('carries NUL and invalid UTF-8 untouched', async () => {
+    const raw = Buffer.from([0x00, 0xff, 0xfe, 0x41])
+    await writeFile(join(dir, 'a.bin'), raw)
+    expect(Buffer.from(await fs.readByteRange(await fs.resolve('a.bin'), { offset: 0, length: 4 }))).toEqual(raw)
+  })
+
+  it('rejects a missing file, a directory, and an already-aborted signal', async () => {
+    await expect(fs.readByteRange(await fs.resolve('nope'), { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+    await expect(fs.readByteRange(await fs.resolve('.'), { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_REGULAR_FILE' })
+    await writeFile(join(dir, 'a.bin'), 'data')
+    const controller = new AbortController()
+    controller.abort()
+    await expect(fs.readByteRange(await fs.resolve('a.bin'), { offset: 0, length: 1 }, controller.signal)).rejects.toMatchObject({ code: 'FS_ABORTED' })
   })
 })
 
@@ -812,73 +833,5 @@ describe('HMR / disposal', () => {
     expect(local.fs).toBeDefined()
     await localFiber.dispose()
     expect(local.fs).toBeUndefined()
-  })
-})
-
-describe('mutation backups', () => {
-  it('preserves the exact original bytes and reports no backup for a create', async () => {
-    const existingPath = join(dir, 'binary.dat')
-    const original = Buffer.from([0, 255, 13, 10, 65])
-    await writeFile(existingPath, original)
-    const existing = await fs.resolve(existingPath)
-    const updated = await fs.writeText(existing, 'text', {
-      intent: { kind: 'replaceIfVersion', version: await versionOf(existing) },
-      backup: 'required',
-    })
-    expect(updated.backup).toMatchObject({ bytes: original.length })
-    if (updated.backup === null) throw new Error('expected update backup')
-    expect(await readFile(updated.backup.path)).toEqual(original)
-    expect(updated.backup.sourceVersion).not.toBe(updated.version)
-
-    const created = await fs.writeText(await fs.resolve('new.txt'), 'new', {
-      intent: { kind: 'createIfAbsent' },
-      backup: 'required',
-    })
-    expect(created.backup).toBeNull()
-  })
-
-  it('does not back up a failed match and blocks publication when backup creation fails', async () => {
-    const path = join(dir, 'story.txt')
-    await writeFile(path, 'original')
-    const target = await fs.resolve(path)
-    await expect(fs.editText(target, {
-      oldString: 'absent', newString: 'x', replaceAll: false,
-    }, { version: await versionOf(target), backup: 'required' })).rejects.toMatchObject({ code: 'FS_EDIT_NOT_FOUND' })
-    await expect(access(join(dir, '.backups'))).rejects.toMatchObject({ code: 'ENOENT' })
-
-    const blockedRoot = join(dir, 'not-a-directory')
-    await writeFile(blockedRoot, 'occupied')
-    await fiber.dispose()
-    fiber = await ctx.plugin(TestLocalFileSystem, { cwd: dir, backupRoot: blockedRoot })
-    fs = ctx.fs as TestLocalFileSystem
-    await expect(fs.writeText(target, 'replacement', {
-      intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
-      backup: 'required',
-    })).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
-    expect(await readFile(path, 'utf8')).toBe('original')
-  })
-
-  it('retains the newest three backups and narrows an external-write race', async () => {
-    const path = join(dir, 'versions.txt')
-    await writeFile(path, 'v0')
-    const target = await fs.resolve(path)
-    const backups: string[] = []
-    for (let index = 1; index <= 4; index += 1) {
-      const outcome = await fs.writeText(target, `v${index}`, {
-        intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
-        backup: 'required',
-      })
-      if (outcome.backup === null) throw new Error('expected update backup')
-      backups.push(outcome.backup.path)
-    }
-    await expect(access(backups[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
-    for (const backup of backups.slice(1)) await expect(access(backup)).resolves.toBeUndefined()
-
-    fs.internals.afterBackup = async () => writeFile(path, 'external')
-    await expect(fs.writeText(target, 'ours', {
-      intent: { kind: 'replaceIfVersion', version: await versionOf(target) },
-      backup: 'required',
-    })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
-    expect(await readFile(path, 'utf8')).toBe('external')
   })
 })

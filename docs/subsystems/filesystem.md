@@ -12,7 +12,7 @@ Provider source: [`packages/fs/fs/src/types.ts`](../../packages/fs/fs/src/types.
 
 Every operation resolves a user-supplied path to an opaque backend target first. Consumers may display `displayPath`, but must not parse `targetKey` (a branded opaque id) or assume it is a local absolute path.
 
-Consumers that share the filesystem's execution world obtain cross-capability coordinates through the provider instead of interpreting that identity: `processPath(target)` returns the canonical absolute path a subprocess can open, `fileUrl(target)` returns its provider-platform `file:` URI, and `contains(parent, child)` tests canonical identity or descendant containment.
+Consumers that share the filesystem's execution world obtain cross-capability coordinates through the provider instead of interpreting that identity: `processPath(target)` returns the canonical absolute path a subprocess can open, `processPathFromHostPath(hostPath)` maps an absolute harness-host file only when that execution world shares it, `fileUrl(target)` returns its provider-platform `file:` URI, and `contains(parent, child)` tests canonical identity or descendant containment.
 
 ```ts type-equiv
 /**
@@ -113,7 +113,7 @@ interface FsDirEntry {
 
 ## Write and edit guards (provider contract)
 
-Both `writeText` and `editText` require an explicit options object. The version fields inside it remain optional: omit `intent`/`version` for an unconditional bare-provider mutation, or supply the policy-produced guard. Every caller explicitly selects `backup: 'required' | 'disabled'`; cancellation and sandbox policy travel in the same object. `createIfAbsent` publishes without replacement, while `replaceIfVersion` and edit reject a changed target with `FS_STALE_VERSION`.
+Both `writeText` and `editText` take their version guard OPTIONALLY: omit it for an unconditional (bare-provider) mutation, supply it to guard. `writeText`'s guard is an `FsWriteIntent` — `createIfAbsent` creates a missing target and rejects an existing one with `FS_NOT_OBSERVED`, including a target that appears after the provider's initial probe because publication itself must be no-replace; `replaceIfVersion` replaces only when the target exists at the observed version, else `FS_STALE_VERSION`. Omitting `expected` unconditionally creates-or-overwrites. The union itself carries only the two guarded intents; "no guard" is expressed by omission, so write and edit both use the same optional `expected` field.
 
 ```ts type-equiv
 /**
@@ -126,53 +126,6 @@ type FsWriteIntent =
   | { kind: 'createIfAbsent' }
   | { kind: 'replaceIfVersion'; version: FsVersion }
 ```
-
-```ts type-equiv
-/** Whether a provider must preserve an existing target before mutation. */
-type FsBackupPolicy = 'required' | 'disabled'
-```
-
-```ts type-equiv
-/** Recoverable provider-owned copy of the bytes that preceded a mutation. */
-interface FsBackupRef {
-  /** Backend path from which the original bytes can be restored. */
-  path: string
-  /** Exact number of bytes copied into the backup. */
-  bytes: number
-  /** Opaque version of the target whose bytes were copied. */
-  sourceVersion: FsVersion
-}
-```
-
-```ts type-equiv
-/** Explicit options for a full-file mutation. */
-interface FsWriteOptions {
-  /** Optional guarded-create or guarded-replace intent. */
-  intent?: FsWriteIntent
-  /** Whether an existing target must be backed up before publication. */
-  backup: FsBackupPolicy
-  /** Abort before atomic publication takes effect. */
-  signal?: AbortSignal
-  /** Per-call sandbox policy interpreted by a confining provider. */
-  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
-}
-```
-
-```ts type-equiv
-/** Explicit options for a literal-edit mutation. */
-interface FsEditOptions {
-  /** Optional version that must still identify the target. */
-  version?: FsVersion
-  /** Whether the matched existing target must be backed up before publication. */
-  backup: FsBackupPolicy
-  /** Abort before atomic publication takes effect. */
-  signal?: AbortSignal
-  /** Per-call sandbox policy interpreted by a confining provider. */
-  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
-}
-```
-
-For an existing file with a required backup, a provider validates the version, creates a durable byte-for-byte backup inside the target lock, rechecks the source version, and then publishes atomically. Backup failure leaves the target unchanged. A new file or failed match produces no backup. Providers prune old versions only after successful publication; prune failure warns without changing a committed outcome. The source recheck narrows external races but is not a cross-process compare-and-swap primitive.
 
 ```ts type-equiv
 /** Outcome of a full-file write. */
@@ -192,73 +145,20 @@ interface FsWriteOutcome {
   before: string | null
   /** The file's content AFTER the write, LF-normalized to share `before`'s diff basis. */
   after: string
-  /** Recoverable pre-mutation bytes, or null for a create or disabled backup. */
-  backup: FsBackupRef | null
 }
 ```
 
-`editText` is a provider-level mutation, not a `read` plus `write` composed elsewhere. It keeps version validation, matching, backup, line-ending restoration, and atomic publication in one target lock. Progressive mode tries cumulative strategies in this fixed order: LF-normalized exact, trimmed search text, per-line trailing-whitespace normalization, then full-width ASCII/U+3000 normalization. Only the first strategy with matches is considered. A non-`replaceAll` edit must remain unique; approximate candidates never authorize a mutation.
-
-```ts type-equiv
-/** Matching policy for a literal edit request. */
-interface FsEditMatchOptions {
-  /** Whether matching stops at LF-normalized exact text or uses safe fallbacks. */
-  mode: 'exact' | 'progressive'
-  /** Maximum approximate candidates returned after every automatic strategy fails. */
-  candidateLimit: number
-  /** Maximum Unicode-code-point edit distance for an approximate candidate. */
-  candidateMaxDistance: number
-  /** Maximum Unicode code points retained in each candidate preview. */
-  candidatePreviewChars: number
-}
-```
-
-```ts type-equiv
-/** The successful level in the cumulative literal-edit matching sequence. */
-type FsEditMatchStrategy =
-  | 'exact'
-  | 'trimmed'
-  | 'lineTrailingWhitespace'
-  | 'fullWidthAscii'
-```
-
-```ts type-equiv
-/** One non-authoritative nearby line or multiline window for a failed edit. */
-interface FsEditCandidate {
-  /** One-based first line of the candidate window. */
-  line: number
-  /** Unicode-code-point Levenshtein distance from the normalized search text. */
-  distance: number
-  /** Bounded source-text preview of the candidate window. */
-  preview: string
-}
-```
-
-```ts type-equiv
-/** Structured diagnostics attached to literal-edit matching failures. */
-interface FsEditErrorDetails {
-  /** Backend display path of the file that was searched. */
-  path: string
-  /** Cumulative automatic strategies attempted before the failure. */
-  attemptedStrategies: readonly FsEditMatchStrategy[]
-  /** Nearby candidates, ordered by distance and then line number. */
-  candidates: readonly FsEditCandidate[]
-  /** Number of authoritative matches when the edit was ambiguous. */
-  matchCount?: number
-}
-```
+`editText` is a provider-level mutation, not a `read` plus `write` composed elsewhere. When guarded it verifies the expected version BEFORE literal matching (so a stale edit reports `FS_STALE_VERSION`, not a match failure against newer content); unguarded it edits the current content. Either way it applies the replacement and writes atomically — keeping matching, line-ending handling, the stale check, and atomic replacement inside one mutation critical section — and a missing target reports `FS_STALE_VERSION` on both paths.
 
 ```ts type-equiv
 /** A literal-replacement edit request. */
 interface FsEditRequest {
-  /** Literal non-empty text to replace. Matching follows `matchOptions` after line-ending normalization. */
+  /** Literal non-empty text to replace. Must match exactly (after line-ending normalization). */
   oldString: string
   /** Literal replacement text. An empty string deletes the matched text. */
   newString: string
   /** Replace every match instead of requiring exactly one. */
   replaceAll: boolean
-  /** Literal matching and failure-diagnostic policy. Omission means exact matching. */
-  matchOptions?: FsEditMatchOptions
 }
 ```
 
@@ -275,18 +175,8 @@ interface FsEditOutcome {
   before: string
   /** The file's content AFTER the edit. */
   after: string
-  /** The first cumulative strategy that produced the authoritative match set. */
-  matchStrategy: FsEditMatchStrategy
-  /** Recoverable pre-mutation bytes, or null when backup was disabled. */
-  backup: FsBackupRef | null
 }
 ```
-
-Failed matching compares a single-line search against each line, or a multiline search against equal-height sliding windows. Banded Levenshtein counts Unicode code points and exits beyond the configured threshold. `FsEditErrorDetails` carries the path, attempted strategies, and bounded `{ line, distance, preview }` candidates for `FS_EDIT_NOT_FOUND` or `FS_AMBIGUOUS_EDIT`.
-
-## Explicit text formats (consumer input)
-
-Tool strings default to `text`: the JSON parser's result is used unchanged, so JSON `"\n"` is a newline and `"\\n"` is a literal backslash plus `n`. A caller may explicitly select `escaped` to decode one additional layer. The strict left-to-right decoder accepts only `\\`, `\n`, `\r`, and `\t`; an unknown sequence or trailing backslash is an argument error before path resolution, backup, or mutation. There is no content heuristic or automatic repair.
 
 ## The fs policy events (provider contract vocabulary)
 
@@ -385,7 +275,7 @@ type FsErrorCode =
 
 ## The service and the plugin
 
-`FileSystem` (`ctx.fs`, abstract) owns the provider primitives: `resolve`, `processPath`, `fileUrl`, `contains`, `stat`, `lstat`, `readText`, `streamText`, `readBytes`, `listDir`, `writeText`, and `editText`. `dsh-fs-observation-policy` registers **no service** — it is a plugin that adds policy through the `fs/*` event gate: it decides the write/edit intent waterfalls from unseen/absent/present state and records `FsObservation` values. The executor is `dsh-tool-fs`: it reads/writes/edits through `ctx.fs`, dispatches the waterfalls, and emits the recording event. The generated [`ctx.fs` section](#ctxfs--filesystem-abstract-seam) below shows the exact signatures.
+`FileSystem` (`ctx.fs`, abstract) owns the provider primitives: `resolve`, `processPath`, `processPathFromHostPath`, `fileUrl`, `contains`, `stat`, `lstat`, `readText`, `streamText`, `readBytes`, `listDir`, `writeText`, and `editText`. `dsh-fs-observation-policy` registers **no service** — it is a plugin that adds policy through the `fs/*` event gate: it decides the write/edit intent waterfalls from unseen/absent/present state and records `FsObservation` values. The executor is `dsh-tool-fs`: it reads/writes/edits through `ctx.fs`, dispatches the waterfalls, and emits the recording event. The generated [`ctx.fs` section](#ctxfs--filesystem-abstract-seam) below shows the exact signatures.
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
@@ -393,7 +283,7 @@ type FsErrorCode =
 
 ## Cordis API
 
-Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — this section is byte-identical in both language sides of the page. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
+Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnpm run verify-cordis-catalog` in doc-sync; regenerate with `pnpm run gen-cordis-catalog`) — the language sides differ only in locale-specific paired document paths. Signature blocks use a `ts cordis-catalog` fence and keep the original source JSDoc; dispatch modes are defined in the [primer](../cordis-primer.md#dispatch-modes), and the framework-inherited `ctx` API lives in [cordis-api/inherited.md](../cordis-api/inherited.md).
 
 <a id="ctxfs--filesystem-abstract-seam"></a>
 
@@ -402,6 +292,16 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 Abstract filesystem provider. Targets must preserve identity across aliases; reads expose regular UTF-8 text or typed errors, listings are stable and content-free, and mutations are atomic. Optional guards add stale protection without changing the unguarded provider contract.
 
 ```ts cordis-catalog
+/**
+ * Observe one file or a directory's direct entries in this provider's execution world.
+ * @param target - resolved file or directory, including an absent path to observe for creation.
+ * @param changed - invalidation callback; errors can be reported during or after initialization.
+ * @param signal - cancels watcher initialization; the caller closes an initialized watcher.
+ * @returns a promise resolving once observation is active, with an asynchronous close function.
+ * @throws when the provider does not support watching or cannot initialize the watcher.
+ */
+watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>>
+
 /**
  * Resolve a model/plugin-supplied path into a stable {@link FsTarget}. May perform I/O (a
  * remote/sandboxed backend may need a round-trip to map a path to a stable identity), hence
@@ -422,6 +322,16 @@ abstract resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): P
  * @returns an absolute path in the backend's execution world.
  */
 abstract processPath(target: FsTarget): string
+
+/**
+ * Map an absolute path from the harness host into this filesystem's
+ * execution world when both paths identify the same file. The base provider
+ * exposes no mapping; host-backed or explicitly shared backends override it.
+ * @param hostPath - absolute path in the harness host filesystem.
+ * @returns the process path for the same file, or undefined when this
+ *   execution world cannot read that host file.
+ */
+processPathFromHostPath(hostPath: string): string | undefined
 
 /**
  * Return the canonical `file:` URI for a target in this filesystem's
@@ -497,6 +407,21 @@ abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterab
 abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
 
 /**
+ * Read one byte window of the regular file as raw bytes with no decoding or
+ * binary rejection: the bytes at `[offset, offset + length)`, shorter when
+ * the file ends inside the window and empty when `offset` lies at or past
+ * its end. The window is the bound here, not the file: a backend transfers
+ * at most `length` bytes of content beyond the prefix it skips to reach
+ * `offset` and never buffers the whole file, so the caller's cap on `length`
+ * is the guard against unbounded buffering.
+ * @param target - the resolved target to read.
+ * @param range - `offset`, the 0-based first byte, and `length`, the largest byte count; both non-negative integers.
+ * @param signal - aborts the read.
+ * @returns the window's bytes, at most `length` long.
+ */
+abstract readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array>
+
+/**
  * List direct children of a directory in stable name order. Returns resolved
  * child targets plus cheap metadata only; never reads file contents.
  * @param target - the resolved directory target.
@@ -506,17 +431,18 @@ abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: 
 abstract listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]>
 
 /**
- * Atomically create or replace UTF-8 text. `options.intent` guards intent and
- * staleness; omission of the intent allows unconditional overwrite.
+ * Atomically create or replace UTF-8 text. `expected` guards intent and
+ * staleness; omission allows unconditional overwrite.
  * @param target - the resolved target to write.
  * @param content - the full new file content.
- * @param options - write intent, backup policy, cancellation, and the per-call
- *   mode and workspace root this write
+ * @param expected - the write intent guarding the write; omit for unconditional.
+ * @param signal - aborts before atomic publication takes effect.
+ * @param sandboxPolicy - the per-call mode and workspace root this write
  *   runs under; a sandboxing backend fences the write by it, the bare backend
  *   ignores it. Omit to leave the backend its own default.
  * @returns the outcome, including the version the write produced.
  */
-abstract writeText( target: FsTarget, content: string, options: FsWriteOptions, ): Promise<FsWriteOutcome>
+abstract writeText( target: FsTarget, content: string, expected?: FsWriteIntent, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsWriteOutcome>
 
 /**
  * Atomically edit literal text. When supplied, the version guard is checked
@@ -524,16 +450,19 @@ abstract writeText( target: FsTarget, content: string, options: FsWriteOptions, 
  * the current content without a freshness precondition.
  * @param target - the resolved target to edit.
  * @param edit - the literal search/replace request.
- * @param options - version guard, backup policy, cancellation, and the per-call
- *   mode and workspace root this edit runs
+ * @param expected - the version guard; omit for an unconditional edit.
+ * @param signal - aborts before atomic publication takes effect.
+ * @param sandboxPolicy - the per-call mode and workspace root this edit runs
  *   under; a sandboxing backend fences the edit by it, the bare backend
  *   ignores it. Omit to leave the backend its own default.
  * @returns the outcome, including the version the edit produced.
  */
-abstract editText( target: FsTarget, edit: FsEditRequest, options: FsEditOptions, ): Promise<FsEditOutcome>
+abstract editText( target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion }, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy, ): Promise<FsEditOutcome>
 ```
 
-Source: [`packages/fs/fs/src/index.ts:109`](../../packages/fs/fs/src/index.ts)
+Types: [SandboxExecutionPolicy](sandbox.md)
+
+Source: [`packages/fs/fs/src/index.ts`](../../packages/fs/fs/src/index.ts)
 
 <a id="fs-events"></a>
 
@@ -556,7 +485,7 @@ Single-slot decision for the next FileSystem.editText. Calling `next()` yields a
 'fs/edit-intent'(target: FsTarget, actor: object | undefined, next: () => { version: FsVersion } | undefined | Promise<{ version: FsVersion } | undefined>): Promise<{ version: FsVersion } | undefined>
 ```
 
-Source: [`packages/fs/fs/src/index.ts:89`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts`](../../packages/fs/fs/src/index.ts)
 
 <a id="fsobserved--emit"></a>
 
@@ -577,7 +506,7 @@ Record an authoritative positive or negative observation. Listeners must be sync
 'fs/observed'(target: FsTarget, observation: FsObservation, actor: object | undefined): void
 ```
 
-Source: [`packages/fs/fs/src/index.ts:99`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts`](../../packages/fs/fs/src/index.ts)
 
 <a id="fswrite-intent--waterfall"></a>
 
@@ -597,5 +526,5 @@ Single-slot decision for the next FileSystem.writeText. Calling `next()` yields 
 'fs/write-intent'(target: FsTarget, actor: object | undefined, next: () => FsWriteIntent | undefined | Promise<FsWriteIntent | undefined>): Promise<FsWriteIntent | undefined>
 ```
 
-Source: [`packages/fs/fs/src/index.ts:81`](../../packages/fs/fs/src/index.ts)
+Source: [`packages/fs/fs/src/index.ts`](../../packages/fs/fs/src/index.ts)
 <!-- END GENERATED cordis-surface -->

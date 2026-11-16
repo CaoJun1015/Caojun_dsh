@@ -11,12 +11,11 @@ import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs
 import type {
   FsDirEntry,
   FsEditOutcome,
-  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
   FsTarget,
-  FsWriteOptions,
+  FsWriteIntent,
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 
@@ -58,6 +57,9 @@ class FakeFileSystem extends FileSystem {
     }
     return bytes
   }
+  override async readByteRange(target: FsTarget, range: { offset: number; length: number }): Promise<Uint8Array> {
+    return new TextEncoder().encode(await this.readText(target)).subarray(range.offset, range.offset + range.length)
+  }
   override async listDir(target: FsTarget): Promise<FsDirEntry[]> {
     if (target.targetKey !== 'skills') throw new FsError(`not a directory: ${target.displayPath}`, 'FS_NOT_DIRECTORY')
     return [
@@ -70,16 +72,16 @@ class FakeFileSystem extends FileSystem {
       },
     ]
   }
-  override async writeText(target: FsTarget, content: string, _options: FsWriteOptions): Promise<FsWriteOutcome> {
+  override async writeText(target: FsTarget, content: string, _expected?: FsWriteIntent): Promise<FsWriteOutcome> {
     const before = this.files.get(target.targetKey) ?? null
     this.files.set(target.targetKey, content)
-    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content, backup: null }
+    return { operation: before !== null ? 'update' : 'create', version: FsVersion('v2'), before, after: content }
   }
-  override async editText(target: FsTarget, edit: FsEditRequest, _options: FsEditOptions): Promise<FsEditOutcome> {
+  override async editText(target: FsTarget, edit: FsEditRequest): Promise<FsEditOutcome> {
     const content = this.files.get(target.targetKey) ?? ''
     const after = content.split(edit.oldString).join(edit.newString)
     this.files.set(target.targetKey, after)
-    return { version: FsVersion('v3'), before: content, after, matchStrategy: 'exact', backup: null }
+    return { version: FsVersion('v3'), before: content, after }
   }
 }
 
@@ -89,6 +91,7 @@ describe('FileSystem provider seam', () => {
     await ctx.plugin(FakeFileSystem)
     const fs = ctx.fs as FakeFileSystem
     expect(fs.sandboxMode).toBeUndefined()
+    expect(fs.processPathFromHostPath('/host/file')).toBeUndefined()
     fs.files.set('a.txt', 'hi')
     const target = await fs.resolve('a.txt')
     expect((await fs.stat(target))?.type).toBe('file')
@@ -120,6 +123,17 @@ describe('FileSystem provider seam', () => {
     expect(streamed).toBe(await fs.readText(target))
   })
 
+  it('readByteRange returns the window, shorter at the end and empty past it', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.bin', 'hello')
+    const target = await fs.resolve('a.bin')
+    expect(await fs.readByteRange(target, { offset: 1, length: 3 })).toEqual(new TextEncoder().encode('ell'))
+    expect(await fs.readByteRange(target, { offset: 3, length: 10 })).toEqual(new TextEncoder().encode('lo'))
+    expect(await fs.readByteRange(target, { offset: 9, length: 2 })).toHaveLength(0)
+  })
+
   it('readBytes returns raw content and enforces the byte cap with FS_TOO_LARGE', async () => {
     const ctx = new Context()
     await ctx.plugin(FakeFileSystem)
@@ -128,6 +142,14 @@ describe('FileSystem provider seam', () => {
     const target = await fs.resolve('a.bin')
     expect(await fs.readBytes(target, undefined, 2)).toEqual(new TextEncoder().encode('hi'))
     await expect(fs.readBytes(target, undefined, 1)).rejects.toMatchObject({ code: 'FS_TOO_LARGE' })
+  })
+
+  it('rejects watching when a provider does not implement observation', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    await expect(fs.watch(await fs.resolve('a.txt'), () => {}, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'FS_IO_ERROR' })
   })
 
   it('listDir returns child entry targets without reading file content', async () => {

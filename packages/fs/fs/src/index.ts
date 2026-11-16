@@ -9,11 +9,11 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
+import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
+import { FsError } from './types.ts'
 import type {
   FsDirEntry,
   FsEditOutcome,
-  FsEditOptions,
   FsEditRequest,
   FsInfo,
   FsPathInfo,
@@ -21,37 +21,16 @@ import type {
   FsTarget,
   FsVersion,
   FsWriteIntent,
-  FsWriteOptions,
   FsWriteOutcome,
 } from './types.ts'
 
-export {
-  applyTextEdit,
-} from './edit-match.ts'
-export {
-  decodeEscapedText,
-  resolveFsText,
-} from './escaped-text.ts'
-export type {
-  FsTextFormat,
-} from './escaped-text.ts'
-export type {
-  FsAppliedTextEdit,
-} from './edit-match.ts'
 export {
   FsError,
   FsTargetKey,
   FsVersion,
 } from './types.ts'
 export type {
-  FsEditCandidate,
-  FsBackupPolicy,
-  FsBackupRef,
-  FsEditErrorDetails,
-  FsEditMatchOptions,
-  FsEditMatchStrategy,
   FsEditOutcome,
-  FsEditOptions,
   FsEditRequest,
   FsDirEntry,
   FsErrorCode,
@@ -60,7 +39,6 @@ export type {
   FsPathInfo,
   FsTarget,
   FsWriteIntent,
-  FsWriteOptions,
   FsWriteOutcome,
 } from './types.ts'
 
@@ -112,6 +90,21 @@ export abstract class FileSystem extends Service {
   }
 
   /**
+   * Observe one file or a directory's direct entries in this provider's execution world.
+   * @param target - resolved file or directory, including an absent path to observe for creation.
+   * @param changed - invalidation callback; errors can be reported during or after initialization.
+   * @param signal - cancels watcher initialization; the caller closes an initialized watcher.
+   * @returns a promise resolving once observation is active, with an asynchronous close function.
+   * @throws when the provider does not support watching or cannot initialize the watcher.
+   */
+  watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>> {
+    void target
+    void changed
+    signal.throwIfAborted()
+    return Promise.reject(new FsError('Filesystem watching is not supported by this provider.', 'FS_IO_ERROR'))
+  }
+
+  /**
    * The sandbox mode this backend enforces on mutations BY DEFAULT, or
    * `undefined` when it does not confine at all — the capability fact the tool
    * layer reads to advertise the escalation fields honestly (mirrors
@@ -147,6 +140,19 @@ export abstract class FileSystem extends Service {
    * @returns an absolute path in the backend's execution world.
    */
   abstract processPath(target: FsTarget): string
+
+  /**
+   * Map an absolute path from the harness host into this filesystem's
+   * execution world when both paths identify the same file. The base provider
+   * exposes no mapping; host-backed or explicitly shared backends override it.
+   * @param hostPath - absolute path in the harness host filesystem.
+   * @returns the process path for the same file, or undefined when this
+   *   execution world cannot read that host file.
+   */
+  processPathFromHostPath(hostPath: string): string | undefined {
+    void hostPath
+    return undefined
+  }
 
   /**
    * Return the canonical `file:` URI for a target in this filesystem's
@@ -222,6 +228,21 @@ export abstract class FileSystem extends Service {
   abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
 
   /**
+   * Read one byte window of the regular file as raw bytes with no decoding or
+   * binary rejection: the bytes at `[offset, offset + length)`, shorter when
+   * the file ends inside the window and empty when `offset` lies at or past
+   * its end. The window is the bound here, not the file: a backend transfers
+   * at most `length` bytes of content beyond the prefix it skips to reach
+   * `offset` and never buffers the whole file, so the caller's cap on `length`
+   * is the guard against unbounded buffering.
+   * @param target - the resolved target to read.
+   * @param range - `offset`, the 0-based first byte, and `length`, the largest byte count; both non-negative integers.
+   * @param signal - aborts the read.
+   * @returns the window's bytes, at most `length` long.
+   */
+  abstract readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array>
+
+  /**
    * List direct children of a directory in stable name order. Returns resolved
    * child targets plus cheap metadata only; never reads file contents.
    * @param target - the resolved directory target.
@@ -231,12 +252,13 @@ export abstract class FileSystem extends Service {
   abstract listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]>
 
   /**
-   * Atomically create or replace UTF-8 text. `options.intent` guards intent and
-   * staleness; omission of the intent allows unconditional overwrite.
+   * Atomically create or replace UTF-8 text. `expected` guards intent and
+   * staleness; omission allows unconditional overwrite.
    * @param target - the resolved target to write.
    * @param content - the full new file content.
-   * @param options - write intent, backup policy, cancellation, and the per-call
-   *   mode and workspace root this write
+   * @param expected - the write intent guarding the write; omit for unconditional.
+   * @param signal - aborts before atomic publication takes effect.
+   * @param sandboxPolicy - the per-call mode and workspace root this write
    *   runs under; a sandboxing backend fences the write by it, the bare backend
    *   ignores it. Omit to leave the backend its own default.
    * @returns the outcome, including the version the write produced.
@@ -244,7 +266,9 @@ export abstract class FileSystem extends Service {
   abstract writeText(
     target: FsTarget,
     content: string,
-    options: FsWriteOptions,
+    expected?: FsWriteIntent,
+    signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome>
 
   /**
@@ -253,8 +277,9 @@ export abstract class FileSystem extends Service {
    * the current content without a freshness precondition.
    * @param target - the resolved target to edit.
    * @param edit - the literal search/replace request.
-   * @param options - version guard, backup policy, cancellation, and the per-call
-   *   mode and workspace root this edit runs
+   * @param expected - the version guard; omit for an unconditional edit.
+   * @param signal - aborts before atomic publication takes effect.
+   * @param sandboxPolicy - the per-call mode and workspace root this edit runs
    *   under; a sandboxing backend fences the edit by it, the bare backend
    *   ignores it. Omit to leave the backend its own default.
    * @returns the outcome, including the version the edit produced.
@@ -262,7 +287,9 @@ export abstract class FileSystem extends Service {
   abstract editText(
     target: FsTarget,
     edit: FsEditRequest,
-    options: FsEditOptions,
+    expected?: { version: FsVersion },
+    signal?: AbortSignal,
+    sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome>
 }
 

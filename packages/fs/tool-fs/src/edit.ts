@@ -9,12 +9,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
-import type { FsEditMatchOptions, FsEditMatchStrategy } from '@deepseek-ai/dsh-fs'
-import { resolveFsText } from '@deepseek-ai/dsh-fs'
-import type { FsTextFormat } from '@deepseek-ai/dsh-fs'
-import type {} from '@deepseek-ai/dsh-system-prompt'
 import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
-import { formatEditFsError, remediateFsError } from './error.ts'
+import { remediateFsError } from './error.ts'
+import { mutationResult } from './mutation-result.ts'
 import { sessionResolveOptions } from './session-cwd.ts'
 import type { FsSandboxController } from './sandbox.ts'
 
@@ -35,8 +32,6 @@ interface EditToolArgs {
   file_path: string
   old_string: string
   new_string: string
-  old_string_format?: FsTextFormat
-  new_string_format?: FsTextFormat
   replace_all?: boolean
   sandbox_permissions?: string
   justification?: string
@@ -49,23 +44,14 @@ interface EditToolArgs {
  * @param args - the schema-validated raw tool arguments.
  * @returns the camelCased input with `replace_all` defaulted to false.
  */
-export function parseEditArgs(args: {
-  file_path: string
-  old_string: string
-  new_string: string
-  old_string_format?: FsTextFormat
-  new_string_format?: FsTextFormat
-  replace_all?: boolean
-}): EditInput {
+export function parseEditArgs(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }): EditInput {
   if (args.file_path.trim().length === 0) throw new Error('file_path must be a non-empty string')
-  const oldString = resolveFsText(args.old_string, args.old_string_format ?? 'text', 'old_string')
-  const newString = resolveFsText(args.new_string, args.new_string_format ?? 'text', 'new_string')
-  if (oldString.length === 0) throw new Error('old_string must be a non-empty string')
-  if (oldString === newString) throw new Error('old_string and new_string must differ')
+  if (args.old_string.length === 0) throw new Error('old_string must be a non-empty string')
+  if (args.old_string === args.new_string) throw new Error('old_string and new_string must differ')
   return {
     filePath: args.file_path,
-    oldString,
-    newString,
+    oldString: args.old_string,
+    newString: args.new_string,
     replaceAll: args.replace_all ?? false,
   }
 }
@@ -74,59 +60,39 @@ export function parseEditArgs(args: {
  * Format an edit success (single-match or replace-all) as a Claude-style model-facing message.
  * @param displayPath - the backend-resolved path shown to the model.
  * @param replaceAll - selects the all-occurrences wording over the single-replacement one.
- * @param strategy - authoritative matching strategy used by the provider.
- * @param backup - model-safe recovery path and byte count, or null.
  * @returns the confirmation sentence the model sees as the tool result.
  */
-export function formatEditOutput(
-  displayPath: string,
-  replaceAll: boolean,
-  strategy: FsEditMatchStrategy = 'exact',
-  backup: { path: string; bytes: number } | null = null,
-): string {
-  const confirmation = replaceAll
+export function formatEditOutput(displayPath: string, replaceAll: boolean): string {
+  return replaceAll
     ? `The file ${displayPath} has been updated. All occurrences were successfully replaced.`
     : `The file ${displayPath} has been updated successfully.`
-  const recovery = backup === null ? '' : ` Backup: ${backup.path} (${backup.bytes} bytes).`
-  return strategy === 'exact'
-    ? `${confirmation}${recovery}`
-    : `${confirmation}${recovery} Warning: the edit used the ${strategy} fallback matching strategy.`
 }
 
 /**
- * Register the `edit` tool and its system-prompt guidance.
+ * Register the `edit` tool and its scope-aware system-prompt guidance.
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
  * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
- * @param matchOptions - provider matching and candidate-diagnostic policy.
- * @param backupBeforeMutation - whether existing files require a provider backup.
  */
-export function applyEditTool(
-  ctx: Context,
-  sandbox: FsSandboxController,
-  matchOptions: FsEditMatchOptions,
-  backupBeforeMutation: boolean,
-): void {
+export function applyEditTool(ctx: Context, sandbox: FsSandboxController): void {
   ctx.systemPrompt.section({
     name: 'tool:edit',
-    order: 102,
-    text: 'Use the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must identify exactly one match. Progressive matching may ignore outer search whitespace, per-line trailing whitespace, or full-width ASCII differences, but it never uses approximate candidates for replacement. String formats default to text, which uses JSON-decoded strings unchanged: JSON "\\n" is a newline, while "\\\\n" is a literal backslash plus n. Select escaped only to decode one additional layer. If several matches remain, provide more context or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+    order: ctx.systemPrompt.getSectionOrder('TOOL_EDIT'),
+    text: ({ scope }) => ctx.tools.get('edit', scope) === undefined
+      ? ''
+      : 'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
   })
 
   ctx.tools.register(defineTool({
     name: 'edit',
     description: 'Edit an existing UTF-8 text file by replacing literal text.',
     parameters: {
-      file_path: { type: 'string', required: true, description: 'Path to edit, resolved by the filesystem backend.' },
-      old_string: { type: 'string', required: true, description: 'Literal text to replace. It must identify a unique match after the configured safe matching strategies.' },
+      file_path: {
+        type: 'string', required: true,
+        description: 'Path to edit, resolved by the filesystem backend. '
+          + 'Provide `file_path` before `old_string` and `new_string` in the arguments.',
+      },
+      old_string: { type: 'string', required: true, description: 'Literal text to replace.' },
       new_string: { type: 'string', required: true, description: 'Literal replacement text. Use an empty string to delete the match.' },
-      old_string_format: {
-        type: 'string', enum: ['text', 'escaped'],
-        description: 'old_string transport. Defaults to text; escaped decodes exactly one strict escape layer.',
-      },
-      new_string_format: {
-        type: 'string', enum: ['text', 'escaped'],
-        description: 'new_string transport. Defaults to text; escaped decodes exactly one strict escape layer.',
-      },
       replace_all: { type: 'boolean', description: 'Replace all matches. Defaults to false; when false, old_string must appear exactly once.' },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
     },
@@ -135,37 +101,18 @@ export function applyEditTool(
         type: 'object',
         additionalProperties: false,
         properties: {
-          path: { type: 'string', required: true },
+          path: { type: 'string', required: true, description: 'Canonical absolute path in the filesystem execution world.' },
           before: { type: 'string', required: true },
           after: { type: 'string', required: true },
-          match_strategy: { type: 'string', required: true },
-          backup: {
-            required: true,
-            oneOf: [
-              { type: 'null' },
-              {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  path: { type: 'string', required: true },
-                  bytes: { type: 'integer', required: true },
-                },
-              },
-            ],
-          },
         },
       },
       render: (args, value) => [{
         type: 'text',
-        text: formatEditOutput(
-          value.path,
-          args.replace_all ?? false,
-          value.match_strategy as FsEditMatchStrategy,
-          value.backup,
-        ),
+        text: formatEditOutput(value.path, args.replace_all ?? false),
       }],
-      presentationMeta: (args, value) => ({
-        diffs: computeHunkDiffs(args.file_path, value.before, value.after)
+      presentationMeta: (_args, value) => ({
+        path: value.path,
+        diffs: computeHunkDiffs(value.path, value.before, value.after)
           .map(({ path, oldText, newText }) => ({ path, oldText, newText })),
       }),
     },
@@ -174,7 +121,7 @@ export function applyEditTool(
       // Resolve the per-call sandbox policy (approved mode > session override
       // > backend default, plus the session cwd root) BEFORE anything executes.
       const sandboxPolicy = await sandbox.resolvePolicy('edit', args, exec)
-      const target = await ctx.fs.resolve(input.filePath, sessionResolveOptions(exec, input.filePath, sandboxPolicy?.workspaceRoot))
+      const target = await ctx.fs.resolve(input.filePath, await sessionResolveOptions(ctx, exec))
       // Single-slot decision: the policy plugin returns { version: vObserved } or
       // throws FS_NOT_OBSERVED; the bare default is undefined (unconditional edit).
       // No stat — the bare default never manufactures a version basis. The intent
@@ -186,47 +133,27 @@ export function applyEditTool(
         const intent = await ctx.waterfall('fs/edit-intent', target, exec, () => undefined)
         outcome = await ctx.fs.editText(
           target,
-          {
-            oldString: input.oldString,
-            newString: input.newString,
-            replaceAll: input.replaceAll,
-            matchOptions,
-          },
-          {
-            ...intent === undefined ? {} : { version: intent.version },
-            backup: backupBeforeMutation ? 'required' : 'disabled',
-            signal: exec.signal,
-            ...sandboxPolicy === undefined ? {} : { sandboxPolicy },
-          },
+          { oldString: input.oldString, newString: input.newString, replaceAll: input.replaceAll },
+          intent,
+          exec.signal,
+          sandboxPolicy,
         )
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
-        // recognizes it from bash); stale/not-observed failures gain their
-        // model-facing remedy; anything else passes through.
-        throw formatEditFsError(remediateFsError(sandbox.mapError(error, sandboxPolicy)), 'old_string')
+        // recognizes it from bash); guarded mutation failures receive their
+        // stable model-facing diagnostic; anything else passes through.
+        throw remediateFsError(sandbox.mapError(error, sandboxPolicy), target.displayPath)
       }
-      // Record the present observation (a no-op when no policy plugin listens).
-      ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
-      return {
-        path: target.displayPath,
-        before: outcome.before,
-        after: outcome.after,
-        match_strategy: outcome.matchStrategy,
-        backup: outcome.backup === null
-          ? null
-          : { path: outcome.backup.path, bytes: outcome.backup.bytes },
-      }
+      return mutationResult(ctx, target, outcome, exec)
     },
     // Pure display: a diff card of the literal replacement (old_string → new_string), derived
     // from the call args. `oldText: old_string || null` matches claude-agent-acp's Edit arm;
     // new_string is a required arg here, so it maps straight to newText.
     presentCall(args): DiffCallView {
-      const oldText = resolveFsText(args.old_string, args.old_string_format ?? 'text', 'old_string')
-      const newText = resolveFsText(args.new_string, args.new_string_format ?? 'text', 'new_string')
       return {
         card: 'diff',
         title: `Edit ${args.file_path}`,
-        diffs: [{ path: args.file_path, oldText: oldText || null, newText }],
+        diffs: [{ path: args.file_path, oldText: args.old_string || null, newText: args.new_string }],
         locations: [{ path: args.file_path }],
       }
     },

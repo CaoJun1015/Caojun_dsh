@@ -6,28 +6,31 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import { constants as bufferConstants } from 'node:buffer'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { once } from 'node:events'
+import { watch } from 'chokidar'
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import z from '@deepseek-ai/schemastery'
-import { applyTextEdit, FileSystem, FsError, FsVersion } from '@deepseek-ai/dsh-fs'
-import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import { FileSystem, FsError, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
   FsDirEntry,
   FsEditOutcome,
   FsEditRequest,
-  FsEditOptions,
   FsInfo,
   FsPathInfo,
   FsTarget,
-  FsWriteOptions,
+  FsWriteIntent,
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 import {
+  applyLiteralEdit,
   listDirectory,
+  localDisplayPath,
   normalizeLineEndings,
   probe,
   probeNoFollow,
   readForEdit,
+  readByteWindow,
   readTextForDiff,
   readWholeBytes,
   readWholeText,
@@ -37,8 +40,6 @@ import {
   writeFileAtomic,
 } from './fsio.ts'
 import type { FsIoInternals } from './fsio.ts'
-import { createLocalBackup, pruneLocalBackups } from './backup.ts'
-import type { FsBackupInternals } from './backup.ts'
 
 /** Configuration for the local filesystem backend. */
 export interface Config {
@@ -49,12 +50,6 @@ export interface Config {
    * runtime's safe allocation/decode maximum. Defaults to 10 MiB.
    */
   diffBasisMaxBytes?: number
-  /** Whether required mutation backups can be created. Defaults to true. */
-  backupEnabled?: boolean
-  /** Private provider-owned backup directory. Defaults to the DSH home backups directory. */
-  backupRoot?: string
-  /** Number of newest backups retained per canonical target. Defaults to 3. */
-  backupVersionsPerTarget?: number
 }
 
 type ResolvedConfig = Required<Config>
@@ -71,18 +66,38 @@ const MAX_DIFF_BASIS_BYTES = Math.min(
  * containment with a stricter backend or a `tools/execute` permission plugin.
  */
 export class LocalFileSystem extends FileSystem {
+  override async watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>> {
+    signal.throwIfAborted()
+    const path = resolve(this.processPath(target))
+    const directory = (await this.stat(target, signal))?.type === 'directory'
+    signal.throwIfAborted()
+    const root = directory ? path : dirname(path)
+    const watcher = watch(root, {
+      ignoreInitial: true, depth: 0,
+      ignored: entry => !directory && resolve(entry) !== root && resolve(entry) !== path,
+    })
+    watcher.on('all', (_event, entry) => {
+      if (directory || resolve(entry) === path) changed()
+    })
+    watcher.on('error', (error) => { changed(error instanceof Error ? error : new Error(String(error))) })
+    try {
+      await once(watcher, 'ready', { signal })
+      return () => watcher.close()
+    } catch (error) {
+      await watcher.close()
+      throw error
+    }
+  }
+
   static Config: z<Config> = z.object({
     cwd: z.string().default(process.cwd()),
     diffBasisMaxBytes: z.number().default(DEFAULT_DIFF_BASIS_MAX_BYTES),
-    backupEnabled: z.boolean().default(true),
-    backupRoot: z.string().default(dshHomePath('backups')),
-    backupVersionsPerTarget: z.number().default(3),
   })
 
   /** Validated config (schemastery applied the defaults before construction). */
   readonly config: ResolvedConfig
   /** Test hook forwarded to fsio for atomic-publication boundaries. */
-  internals: FsIoInternals & FsBackupInternals = {}
+  internals: FsIoInternals = {}
   /** Per-targetKey tail promise: serializes mutating ops so the read→guard→write
    * window can't interleave, making concurrent writes/edits deterministically
    * ordered (one wins, the rest see the new version and reject as stale). */
@@ -95,12 +110,6 @@ export class LocalFileSystem extends FileSystem {
       || resolved.diffBasisMaxBytes <= 0
       || resolved.diffBasisMaxBytes > MAX_DIFF_BASIS_BYTES) {
       throw new Error(`fs-local: diffBasisMaxBytes must be a positive safe integer no greater than ${MAX_DIFF_BASIS_BYTES}`)
-    }
-    if (resolved.backupRoot.trim().length === 0) {
-      throw new Error('fs-local: backupRoot must be non-empty')
-    }
-    if (!Number.isSafeInteger(resolved.backupVersionsPerTarget) || resolved.backupVersionsPerTarget <= 0) {
-      throw new Error('fs-local: backupVersionsPerTarget must be a positive safe integer')
     }
     this.config = resolved
   }
@@ -132,6 +141,10 @@ export class LocalFileSystem extends FileSystem {
     return String(target.targetKey)
   }
 
+  override processPathFromHostPath(hostPath: string): string | undefined {
+    return isAbsolute(hostPath) ? resolve(hostPath) : undefined
+  }
+
   override fileUrl(target: FsTarget): string {
     return pathToFileURL(this.processPath(target)).href
   }
@@ -152,7 +165,8 @@ export class LocalFileSystem extends FileSystem {
   override async lstat(path: string, opts?: { cwd?: string }, signal?: AbortSignal): Promise<FsPathInfo | undefined> {
     if (signal?.aborted) throw new FsError('lstat aborted', 'FS_ABORTED')
     if (path.trim().length === 0) throw new FsError('file_path must be a non-empty string', 'FS_NOT_FOUND')
-    const info = await probeNoFollow(resolve(opts?.cwd ?? this.config.cwd, path))
+    const cwd = opts?.cwd ?? this.config.cwd
+    const info = await probeNoFollow(localDisplayPath(cwd, path))
     if (signal?.aborted) throw new FsError('lstat aborted', 'FS_ABORTED')
     if (!info) return undefined
     return { version: info.version, type: info.type, size: info.size }
@@ -170,6 +184,10 @@ export class LocalFileSystem extends FileSystem {
     return readWholeBytes({ displayPath: target.displayPath, targetKey: target.targetKey }, signal, maxBytes, this.internals)
   }
 
+  override async readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array> {
+    return readByteWindow({ displayPath: target.displayPath, targetKey: target.targetKey }, range, signal)
+  }
+
   override async listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {
     const entries = await listDirectory({ displayPath: target.displayPath, targetKey: target.targetKey }, signal)
     return entries.map(entry => ({
@@ -184,22 +202,22 @@ export class LocalFileSystem extends FileSystem {
   override async writeText(
     target: FsTarget,
     content: string,
-    options: FsWriteOptions,
+    expected?: FsWriteIntent,
+    signal?: AbortSignal,
   ): Promise<FsWriteOutcome> {
     return this.withLock(target.targetKey, async () => {
-      const { intent, signal } = options
       const existing = await probe(target.targetKey)
       if (existing && existing.type !== 'file') {
         throw new FsError(`cannot write "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
       }
 
-      if (intent?.kind === 'replaceIfVersion') {
+      if (expected?.kind === 'replaceIfVersion') {
         // Stale guard: the file must still exist at the version the owner observed.
         if (!existing) throw new FsError(`cannot write "${target.displayPath}": file no longer exists`, 'FS_STALE_VERSION')
-        if (existing.version !== intent.version) {
+        if (existing.version !== expected.version) {
           throw new FsError(`cannot write "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
         }
-      } else if (intent?.kind === 'createIfAbsent' && existing) {
+      } else if (expected?.kind === 'createIfAbsent' && existing) {
         // createIfAbsent onto an existing file: a blind overwrite — require a read first.
         throw new FsError(`cannot overwrite existing "${target.displayPath}" without reading it first`, 'FS_NOT_OBSERVED')
       }
@@ -215,31 +233,15 @@ export class LocalFileSystem extends FileSystem {
       const before = diffable
         ? await readTextForDiff(target.targetKey, this.config.diffBasisMaxBytes, signal)
         : null
-      const createdBackup = existing !== null && options.backup === 'required'
-        ? await createLocalBackup(target.targetKey, existing.version, this.config, signal, this.internals)
-        : undefined
-      if (createdBackup !== undefined) {
-        const current = await probe(target.targetKey)
-        if (current === null || current.version !== existing?.version) {
-          throw new FsError(`cannot write "${target.displayPath}": file changed while it was being backed up`, 'FS_STALE_VERSION')
-        }
-      }
       await writeFileAtomic(
         target.targetKey,
         content,
         existing?.mode,
         signal,
         this.internals,
-        intent?.kind === 'createIfAbsent' ? { displayPath: target.displayPath } : undefined,
+        expected?.kind === 'createIfAbsent' ? { displayPath: target.displayPath } : undefined,
       )
       const after = await probe(target.targetKey)
-      if (createdBackup !== undefined) {
-        try {
-          await pruneLocalBackups(createdBackup.targetDirectory, this.config.backupVersionsPerTarget)
-        } catch (error: unknown) {
-          this.ctx.logger.warn(`fs-local: failed to prune backups for ${target.displayPath}: ${String(error)}`)
-        }
-      }
       return {
         operation: existing ? 'update' : 'create',
         version: this.versionAfterWrite(after, target),
@@ -248,7 +250,6 @@ export class LocalFileSystem extends FileSystem {
         // overwrite must not read as every line changed. Line-ending restoration
         // is a storage detail the applied-hunk diff ignores.
         after: normalizeLineEndings(content),
-        backup: createdBackup?.ref ?? null,
       }
     })
   }
@@ -256,10 +257,10 @@ export class LocalFileSystem extends FileSystem {
   override async editText(
     target: FsTarget,
     edit: FsEditRequest,
-    options: FsEditOptions,
+    expected?: { version: FsVersion },
+    signal?: AbortSignal,
   ): Promise<FsEditOutcome> {
     return this.withLock(target.targetKey, async () => {
-      const { signal } = options
       const existing = await probe(target.targetKey)
       // Stale guard before literal matching: an edit based on an old read reports
       // FS_STALE_VERSION, not FS_EDIT_NOT_FOUND/FS_AMBIGUOUS_EDIT against newer content.
@@ -269,40 +270,22 @@ export class LocalFileSystem extends FileSystem {
       // expected === undefined: unconditional edit of the current content — no
       // version guard. Still inside the per-target lock, so the read→match→write
       // window is serialized and atomic.
-      if (options.version !== undefined && existing.version !== options.version) {
+      if (expected && existing.version !== expected.version) {
         throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
       }
 
       const original = await readForEdit(target.targetKey, target.displayPath, signal)
-      const edited = applyTextEdit(original.content, edit, target.displayPath)
-      const createdBackup = options.backup === 'required'
-        ? await createLocalBackup(target.targetKey, existing.version, this.config, signal, this.internals)
-        : undefined
-      if (createdBackup !== undefined) {
-        const current = await probe(target.targetKey)
-        if (current === null || current.version !== existing.version) {
-          throw new FsError(`cannot edit "${target.displayPath}": file changed while it was being backed up`, 'FS_STALE_VERSION')
-        }
-      }
+      const edited = applyLiteralEdit(original.content, edit.oldString, edit.newString, edit.replaceAll, target.displayPath)
       const content = restoreLineEndings(edited.content, original.lineEndings)
       await writeFileAtomic(target.targetKey, content, existing.mode, signal, this.internals)
 
       const after = await probe(target.targetKey)
-      if (createdBackup !== undefined) {
-        try {
-          await pruneLocalBackups(createdBackup.targetDirectory, this.config.backupVersionsPerTarget)
-        } catch (error: unknown) {
-          this.ctx.logger.warn(`fs-local: failed to prune backups for ${target.displayPath}: ${String(error)}`)
-        }
-      }
       return {
         version: this.versionAfterWrite(after, target),
         // The LF-normalized before/after text (the applied-hunk diff basis);
         // line-ending restoration is a storage detail the diff ignores.
         before: original.content,
         after: edited.content,
-        matchStrategy: edited.matchStrategy,
-        backup: createdBackup?.ref ?? null,
       }
     })
   }

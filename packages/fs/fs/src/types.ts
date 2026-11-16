@@ -124,84 +124,6 @@ export type FsWriteIntent =
   | { kind: 'createIfAbsent' }
   | { kind: 'replaceIfVersion'; version: FsVersion }
 
-/** Whether a provider must preserve an existing target before mutation. */
-export type FsBackupPolicy = 'required' | 'disabled'
-
-/** Recoverable provider-owned copy of the bytes that preceded a mutation. */
-export interface FsBackupRef {
-  /** Backend path from which the original bytes can be restored. */
-  path: string
-  /** Exact number of bytes copied into the backup. */
-  bytes: number
-  /** Opaque version of the target whose bytes were copied. */
-  sourceVersion: FsVersion
-}
-
-/** Explicit options for a full-file mutation. */
-export interface FsWriteOptions {
-  /** Optional guarded-create or guarded-replace intent. */
-  intent?: FsWriteIntent
-  /** Whether an existing target must be backed up before publication. */
-  backup: FsBackupPolicy
-  /** Abort before atomic publication takes effect. */
-  signal?: AbortSignal
-  /** Per-call sandbox policy interpreted by a confining provider. */
-  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
-}
-
-/** Explicit options for a literal-edit mutation. */
-export interface FsEditOptions {
-  /** Optional version that must still identify the target. */
-  version?: FsVersion
-  /** Whether the matched existing target must be backed up before publication. */
-  backup: FsBackupPolicy
-  /** Abort before atomic publication takes effect. */
-  signal?: AbortSignal
-  /** Per-call sandbox policy interpreted by a confining provider. */
-  sandboxPolicy?: import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy
-}
-
-/** Matching policy for a literal edit request. */
-export interface FsEditMatchOptions {
-  /** Whether matching stops at LF-normalized exact text or uses safe fallbacks. */
-  mode: 'exact' | 'progressive'
-  /** Maximum approximate candidates returned after every automatic strategy fails. */
-  candidateLimit: number
-  /** Maximum Unicode-code-point edit distance for an approximate candidate. */
-  candidateMaxDistance: number
-  /** Maximum Unicode code points retained in each candidate preview. */
-  candidatePreviewChars: number
-}
-
-/** The successful level in the cumulative literal-edit matching sequence. */
-export type FsEditMatchStrategy =
-  | 'exact'
-  | 'trimmed'
-  | 'lineTrailingWhitespace'
-  | 'fullWidthAscii'
-
-/** One non-authoritative nearby line or multiline window for a failed edit. */
-export interface FsEditCandidate {
-  /** One-based first line of the candidate window. */
-  line: number
-  /** Unicode-code-point Levenshtein distance from the normalized search text. */
-  distance: number
-  /** Bounded source-text preview of the candidate window. */
-  preview: string
-}
-
-/** Structured diagnostics attached to literal-edit matching failures. */
-export interface FsEditErrorDetails {
-  /** Backend display path of the file that was searched. */
-  path: string
-  /** Cumulative automatic strategies attempted before the failure. */
-  attemptedStrategies: readonly FsEditMatchStrategy[]
-  /** Nearby candidates, ordered by distance and then line number. */
-  candidates: readonly FsEditCandidate[]
-  /** Number of authoritative matches when the edit was ambiguous. */
-  matchCount?: number
-}
-
 /** Outcome of a full-file write. */
 export interface FsWriteOutcome {
   /** Whether the write created a new file or replaced an existing one. */
@@ -219,20 +141,16 @@ export interface FsWriteOutcome {
   before: string | null
   /** The file's content AFTER the write, LF-normalized to share `before`'s diff basis. */
   after: string
-  /** Recoverable pre-mutation bytes, or null for a create or disabled backup. */
-  backup: FsBackupRef | null
 }
 
 /** A literal-replacement edit request. */
 export interface FsEditRequest {
-  /** Literal non-empty text to replace. Matching follows `matchOptions` after line-ending normalization. */
+  /** Literal non-empty text to replace. Must match exactly (after line-ending normalization). */
   oldString: string
   /** Literal replacement text. An empty string deletes the matched text. */
   newString: string
   /** Replace every match instead of requiring exactly one. */
   replaceAll: boolean
-  /** Literal matching and failure-diagnostic policy. Omission means exact matching. */
-  matchOptions?: FsEditMatchOptions
 }
 
 /** Outcome of a literal edit. */
@@ -247,10 +165,6 @@ export interface FsEditOutcome {
   before: string
   /** The file's content AFTER the edit. */
   after: string
-  /** The first cumulative strategy that produced the authoritative match set. */
-  matchStrategy: FsEditMatchStrategy
-  /** Recoverable pre-mutation bytes, or null when backup was disabled. */
-  backup: FsBackupRef | null
 }
 
 /**
@@ -281,12 +195,9 @@ export type FsErrorCode =
  */
 export class FsError extends HarnessError {
   override readonly code: FsErrorCode
-  /** Structured literal-edit diagnostics, when this is a matching failure. */
-  readonly details: FsEditErrorDetails | undefined
 
-  constructor(message: string, code: FsErrorCode, options?: ErrorOptions & { details?: FsEditErrorDetails }) {
+  constructor(message: string, code: FsErrorCode, options?: ErrorOptions) {
     super(message, code, options)
     this.code = code
-    this.details = options?.details
   }
 }
