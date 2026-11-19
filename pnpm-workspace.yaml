@@ -18,6 +18,13 @@ overrides:
   'extract-zip>yauzl': '3.4.0'
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
+  # Security patches: pin known-safe minor/patch fixes for advisories found by
+  # `pnpm audit --prod`. These are transitive-only pins; no direct manifest
+  # versions change.
+  undici: ^8.12.2
+  zod: ^4.6.6
+  fflate: ^0.8.3
+  fast-uri: ^3.1.9
 
 peerDependencyRules:
   allowedVersions:
